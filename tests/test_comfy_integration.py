@@ -300,3 +300,19 @@ def test_basic_workflow_executes_through_prompt_executor(env, io_dirs):
     from PIL import Image
 
     assert Image.open(saved[-1]).size == (60, 48)
+
+
+@torch.no_grad()
+def test_comfy_attention_dispatch_matches_sdpa_precision(env):
+    """Whatever backend ComfyUI selected must keep FP32 score precision like SDPA."""
+    import comfy.ldm.modules.attention as attention
+
+    from kandinsky_sr.model import comfy_attention, sdpa_attention
+
+    gen = torch.Generator().manual_seed(0)
+    q, k = ((torch.randn(1, 4, 1024, 128, generator=gen) * 3).to(torch.bfloat16) for _ in range(2))
+    v = torch.randn(1, 4, 1024, 128, generator=gen).to(torch.bfloat16)
+    expected = sdpa_attention(q, k, v, 4).float()
+    actual = comfy_attention(q, k, v, 4).float()
+    rel = (actual - expected).norm() / expected.norm()
+    assert rel < 6e-3, (attention.optimized_attention.__name__, rel)

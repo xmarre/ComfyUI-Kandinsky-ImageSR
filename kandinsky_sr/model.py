@@ -88,10 +88,17 @@ def sdpa_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int
 
 
 def comfy_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int) -> torch.Tensor:
-    """ComfyUI optimized attention dispatch (respects the configured backend)."""
+    """ComfyUI optimized attention dispatch (respects the configured backend).
+
+    The reference uses PyTorch SDPA, whose fused kernels accumulate attention scores
+    in FP32. ComfyUI's split/sub-quadratic/basic backends compute scores in the
+    activation dtype unless asked to upcast, which costs about an order of magnitude
+    in accuracy at BF16; ``attn_precision=float32`` requests the upcast (SDPA-based
+    backends ignore it).
+    """
     from comfy.ldm.modules.attention import optimized_attention
 
-    return optimized_attention(q, k, v, heads, skip_reshape=True)
+    return optimized_attention(q, k, v, heads, skip_reshape=True, attn_precision=torch.float32)
 
 
 # --------------------------------------------------------------------------- functional pieces
