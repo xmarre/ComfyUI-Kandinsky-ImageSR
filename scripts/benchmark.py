@@ -7,6 +7,13 @@ warm end-to-end latency, tile throughput, per-stage time (VAE encode, transforme
 VAE decode; measured with device synchronisation, so
 stage timing is only collected when ``--stages`` is given) and peak device memory.
 
+Memory is reported from two sources, kept separate: PyTorch's caching allocator
+(``peak_allocated_gib``/``peak_reserved_gib``) and device-wide usage sampled from
+the driver (``device_used_*_gib``; total minus free, so it includes other
+processes, CUDA context and allocations outside PyTorch's allocator such as those
+of ComfyUI's dynamic VRAM manager). ``transformer_loaded_gib`` is the transformer
+weight memory ComfyUI reports as resident on the device after each run.
+
 Example::
 
     python scripts/benchmark.py --comfyui /path/to/ComfyUI \
@@ -24,6 +31,7 @@ import argparse
 import json
 import statistics
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -35,6 +43,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 def _sync(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+class DeviceMemorySampler:
+    """Peak device-wide memory in use (driver view), sampled in a background thread."""
+
+    def __init__(self, device: torch.device, interval: float = 0.02) -> None:
+        self.device, self.interval = device, interval
+        self.peak = self.start_used = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def used(self) -> int:
+        free, total = torch.cuda.mem_get_info(self.device)
+        return total - free
+
+    def __enter__(self) -> DeviceMemorySampler:
+        self.start_used = self.peak = self.used()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            self.peak = max(self.peak, self.used())
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._thread.join()
+        self.peak = max(self.peak, self.used())
+
+
+def _loaded_bytes(patcher) -> int | None:
+    loaded = getattr(patcher, "loaded_size", None)
+    return int(loaded()) if callable(loaded) else None
 
 
 def main() -> None:
@@ -65,13 +107,12 @@ def main() -> None:
 
     bootstrap(args.comfyui, args.comfy_args)
     import comfy.model_management as mm
+    from _comfy_bootstrap import load_flux_vae
 
     from kandinsky_sr import runtime
 
     device = mm.get_torch_device()
     start = time.perf_counter()
-    from _comfy_bootstrap import load_flux_vae
-
     model = runtime.load_model(
         args.model,
         Path(args.model).name,
@@ -80,11 +121,17 @@ def main() -> None:
         patcher=args.patcher,
     )
     load_seconds = time.perf_counter() - start
+    start = time.perf_counter()
     vae = load_flux_vae(args.vae, args.vae_dtype) or model.bundled_vae()
+    vae_load_seconds = time.perf_counter() - start
+    start = time.perf_counter()
     mm.load_models_gpu([model.patcher, vae.patcher])
     _sync(device)
-    to_device_seconds = time.perf_counter() - start - load_seconds
-    print(f"cold load: {load_seconds:.2f}s from disk, {to_device_seconds:.2f}s to {device}")
+    to_device_seconds = time.perf_counter() - start
+    print(
+        f"cold load: transformer {load_seconds:.2f}s and VAE {vae_load_seconds:.2f}s from disk, "
+        f"{to_device_seconds:.2f}s to {device} ({type(model.patcher).__name__})"
+    )
 
     stage_times: dict[str, list[float]] = {"encode": [], "transform": [], "decode": []}
     if args.stages:
@@ -105,7 +152,9 @@ def main() -> None:
     results = {
         "device": str(device),
         "torch": torch.__version__,
+        "patcher": type(model.patcher).__name__,
         "load_seconds": load_seconds,
+        "vae_load_seconds": vae_load_seconds,
         "to_device_seconds": to_device_seconds,
         "runs": [],
     }
@@ -122,18 +171,25 @@ def main() -> None:
                         if device.type == "cuda":
                             torch.cuda.reset_peak_memory_stats(device)
                         _sync(device)
+                        sampler = DeviceMemorySampler(device) if device.type == "cuda" else None
+                        if sampler is not None:
+                            sampler.__enter__()
                         t = time.perf_counter()
-                        output, stats = runtime.upscale(
-                            model,
-                            image,
-                            factor,
-                            args.creativity,
-                            tile_batch_size=batch,
-                            accumulation_device=acc,
-                            vae=vae,
-                        )
-                        _sync(device)
-                        seconds = time.perf_counter() - t
+                        try:
+                            output, stats = runtime.upscale(
+                                model,
+                                image,
+                                factor,
+                                args.creativity,
+                                tile_batch_size=batch,
+                                accumulation_device=acc,
+                                vae=vae,
+                            )
+                            _sync(device)
+                            seconds = time.perf_counter() - t
+                        finally:
+                            if sampler is not None:
+                                sampler.__exit__(None, None, None)
                         # Release the output before the next repetition so it cannot
                         # reduce the memory available to (and the batch chosen by) it.
                         del output
@@ -149,6 +205,11 @@ def main() -> None:
                         if device.type == "cuda":
                             rep["peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / 1024**3
                             rep["peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / 1024**3
+                            rep["device_used_before_gib"] = sampler.start_used / 1024**3
+                            rep["device_used_peak_gib"] = sampler.peak / 1024**3
+                        loaded = _loaded_bytes(model.patcher)
+                        if loaded is not None:
+                            rep["transformer_loaded_gib"] = loaded / 1024**3
                         if args.stages:
                             rep["stage_seconds"] = {name: sum(v) for name, v in stage_times.items()}
                         repetitions.append(rep)
@@ -171,6 +232,7 @@ def main() -> None:
                     if device.type == "cuda":
                         entry["max_peak_allocated_gib"] = max(r["peak_allocated_gib"] for r in repetitions)
                         entry["max_peak_reserved_gib"] = max(r["peak_reserved_gib"] for r in repetitions)
+                        entry["max_device_used_peak_gib"] = max(r["device_used_peak_gib"] for r in repetitions)
                     if args.stages:
                         entry["median_stage_seconds"] = {
                             name: statistics.median(r["stage_seconds"][name] for r in repetitions)

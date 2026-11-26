@@ -21,6 +21,7 @@ tile twice.
 from __future__ import annotations
 
 import logging
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -171,7 +172,7 @@ class TiledRestorer:
             raise ValueError("tile_batch_size must be at least 1")
 
         batch = images.shape[0]
-        output = torch.empty(batch, g.out_height, g.out_width, 3, device=opts.output_device, dtype=torch.float32)
+        output = _allocate_output((batch, g.out_height, g.out_width, 3), opts.output_device)
         wy, wx = g.weight_profiles()
         queue = [(b, r, c) for b in range(batch) for (r, c) in g.cells()]
         accumulators: dict[int, _Accumulator] = {}
@@ -179,6 +180,7 @@ class TiledRestorer:
         batch_size = opts.tile_batch_size
         position = 0
         acc_device = opts.accumulation_device
+        prepared = None
 
         try:
             while position < len(queue):
@@ -216,9 +218,13 @@ class TiledRestorer:
 
             if accumulators:
                 raise RuntimeError("internal error: unfinished tile accumulators")
-        except BaseException:
-            # The traceback keeps this frame alive; drop the output batch with it.
-            output = None
+        except BaseException as error:
+            # The traceback keeps this frame alive: drop the output batch and the
+            # current tile batch, and clear the finished helper frames (commit,
+            # finalisation, inference), whose locals would otherwise keep tile and
+            # accumulator storage alive for as long as the exception is referenced.
+            output = prepared = None
+            traceback.clear_frames(error.__traceback__)
             raise
         finally:
             # Drop device buffers now, even when an exception propagates to the caller.
@@ -303,6 +309,29 @@ class TiledRestorer:
             weight = wy[start:stop].to(device)[:, None] * wx_dev[None, :]
             rows = buffer[:, start:stop, : g.out_width] / weight
             out[start:stop].copy_(rows.permute(1, 2, 0))
+
+
+def _empty(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    return torch.empty(shape, device=device, dtype=torch.float32)
+
+
+def _allocate_output(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """The FP32 output batch on ``device``, or in system memory when it does not fit there."""
+    cpu = torch.device("cpu")
+    try:
+        return _empty(shape, device)
+    except Exception as error:
+        if not is_oom(error) or torch.device(device) == cpu:
+            raise
+    nbytes = 4
+    for dim in shape:
+        nbytes *= dim
+    logger.warning(
+        "Kandinsky ImageSR: the %s output does not fit on %s; it is kept in system memory",
+        format_bytes(nbytes),
+        device,
+    )
+    return _empty(shape, cpu)
 
 
 def describe_memory(per_tile: int, batch: int, accumulator: int, acc_device: torch.device) -> str:

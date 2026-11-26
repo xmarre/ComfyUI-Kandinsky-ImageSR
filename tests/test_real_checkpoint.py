@@ -7,6 +7,7 @@ KANDINSKY_SR_FLUX_VAE     FLUX.1 ae.safetensors
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -32,7 +33,7 @@ def test_single_file_matches_official_bundle_byte_for_byte():
 
 
 @pytest.mark.skipif(not (BUNDLE and FLUX_VAE), reason="set KANDINSKY_SR_BUNDLE and KANDINSKY_SR_FLUX_VAE")
-def test_bundled_vae_is_flux_ae_rounded_to_bf16(comfy):
+def test_bundled_vae_is_flux_ae_rounded_to_bf16(comfy, caplog):
     import comfy.diffusers_convert
     import comfy.sd
     from safetensors.torch import load_file
@@ -47,7 +48,10 @@ def test_bundled_vae_is_flux_ae_rounded_to_bf16(comfy):
     assert all(torch.equal(bundled[k], flux[k].to(torch.bfloat16)) for k in flux)
     for dtype in (torch.bfloat16, torch.float32):
         vae = comfy.sd.VAE(sd=dict(flux), dtype=dtype)
-        validate_imagesr_vae(vae)  # the shipped fingerprint accepts the real FLUX.1 VAE
+        # the shipped fingerprint and BF16 digests accept the real FLUX.1 VAE without a warning
+        with caplog.at_level(logging.WARNING):
+            validate_imagesr_vae(vae)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         if dtype == torch.bfloat16:  # ComfyUI's bf16 load gives exactly the bundled weights
             state = vae.first_stage_model.state_dict()
             assert all(torch.equal(state[k], bundled[k]) for k in bundled)

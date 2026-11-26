@@ -16,6 +16,7 @@ from .memory import (
     auto_tile_batch,
     choose_accumulation_device,
     format_bytes,
+    is_oom,
     max_active_accumulators,
     tile_io_bytes,
     transformer_tile_bytes,
@@ -278,14 +279,20 @@ def upscale(
     def live_accumulator_bytes(tiles: int) -> int:
         return max_active_accumulators(tiles, grid.num_tiles, batch) * acc_bytes
 
+    device = model.patcher.load_device
+    intermediate = mm.intermediate_device()
+    # The FP32 RGB output lives on ComfyUI's intermediate device for the whole run
+    # (on the GPU with --gpu-only), next to the tile working memory.
+    on_device = device.type != "cpu" and _same_device(intermediate, device)
+    output_bytes = output_buffer_bytes(batch, grid) if on_device else 0
+
     # Reserve working memory only for tiles that can actually run in one batch.
     requested = min(tile_batch_size, total_tiles) if tile_batch_size > 0 else 1
     gpu_acc = live_accumulator_bytes(requested) if accumulation_device == "gpu" else 0
-    mm.load_models_gpu([model.patcher, vae.patcher], memory_required=requested * per_tile + gpu_acc)
+    mm.load_models_gpu([model.patcher, vae.patcher], memory_required=requested * per_tile + gpu_acc + output_bytes)
 
-    device = model.patcher.load_device
     reserved = mm.extra_reserved_memory() if hasattr(mm, "extra_reserved_memory") else 0
-    free = mm.get_free_memory(device) if device.type != "cpu" else 0
+    free = mm.get_free_memory(device) - output_bytes if device.type != "cpu" else 0
     if tile_batch_size > 0:
         batch_size = requested
     elif device.type == "cpu":
@@ -296,7 +303,6 @@ def upscale(
     acc_device = choose_accumulation_device(
         accumulation_device, device, live_accumulator_bytes(batch_size), free - reserved - batch_size * per_tile
     )
-    intermediate = mm.intermediate_device()
     logger.info(
         "Kandinsky ImageSR: %d image(s) %dx%d -> %dx%d, %d tiles (%dx%d grid), t=%s, tile batch %d "
         "(~%s per tile), accumulator %s on %s",
@@ -333,6 +339,37 @@ def upscale(
     finally:
         del rope
 
+    out_dtype = mm.intermediate_dtype() if hasattr(mm, "intermediate_dtype") else torch.float32
+    out_of_memory = False
+    try:
+        return _finish_output(output, alpha, grid, out_dtype), stats
+    except Exception as error:
+        if not is_oom(error) or output.device.type == "cpu":
+            raise
+        out_of_memory = True
+    if out_of_memory:  # outside the except block, so the failed attempt's tensors are released
+        logger.warning("Kandinsky ImageSR: out of memory while assembling the output; finishing in system memory")
+        mm.soft_empty_cache()
+        output = output.cpu()
+    return _finish_output(output, alpha, grid, out_dtype), stats
+
+
+def _same_device(a: torch.device, b: torch.device) -> bool:
+    a, b = torch.device(a), torch.device(b)
+    if a.type != b.type:
+        return False
+    if a.type == "cpu":
+        return True
+    current = torch.cuda.current_device() if a.type == "cuda" and torch.cuda.is_available() else 0
+    return (current if a.index is None else a.index) == (current if b.index is None else b.index)
+
+
+def output_buffer_bytes(batch: int, grid) -> int:
+    """FP32 RGB output batch."""
+    return batch * grid.out_height * grid.out_width * 3 * 4
+
+
+def _finish_output(output: torch.Tensor, alpha: torch.Tensor | None, grid, out_dtype: torch.dtype) -> torch.Tensor:
     if alpha is not None:
         # Alpha is not part of the generative model: resize it bilinearly to the
         # exact output size and append it unchanged in meaning.
@@ -340,8 +377,7 @@ def upscale(
             alpha.movedim(-1, 1).float(), size=(grid.out_height, grid.out_width), mode="bilinear", align_corners=False
         ).clamp_(0.0, 1.0)
         output = torch.cat([output, resized.movedim(1, -1).to(output)], dim=-1)
-
-    out_dtype = mm.intermediate_dtype() if hasattr(mm, "intermediate_dtype") else torch.float32
+        del resized
     if output.dtype != out_dtype:
         output = output.to(out_dtype)
-    return output, stats
+    return output

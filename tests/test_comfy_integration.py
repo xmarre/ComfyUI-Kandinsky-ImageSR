@@ -433,6 +433,34 @@ def test_explicit_batch_reserves_memory_only_for_runnable_tiles(env, monkeypatch
     assert requested == [per_tile]
 
 
+@pytest.mark.parametrize("output_on_device", [True, False])
+def test_device_resident_output_is_part_of_the_memory_budget(env, monkeypatch, output_on_device):
+    """With --gpu-only the FP32 output batch shares the GPU with the tile working memory."""
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    gpu = torch.device("cuda", 0)
+    requested = []
+
+    class Planned(Exception):
+        pass
+
+    def plan(models, memory_required=0, **kwargs):
+        requested.append(memory_required)
+        raise Planned  # stop before anything touches the (simulated) device
+
+    monkeypatch.setattr(model.patcher, "load_device", gpu)
+    monkeypatch.setattr(mm, "intermediate_device", lambda: gpu if output_on_device else torch.device("cpu"))
+    monkeypatch.setattr(mm, "load_models_gpu", plan)
+    image = _image(batch=3, h=40, w=56)
+    with pytest.raises(Planned):
+        runtime.upscale(model, image, 2, 4, tile_batch_size=1, accumulation_device="cpu")
+    per_tile = runtime.estimate_tile_memory(model, model.bundled_vae()).per_tile
+    output = 3 * 80 * 112 * 3 * 4 if output_on_device else 0
+    assert requested == [per_tile + output]
+
+
 # ----------------------------------------------------------------------------- single-file checkpoints and VAEs
 
 

@@ -122,11 +122,25 @@ Nothing is downloaded automatically. Before any weights are read, the loader
 checks every configuration value it depends on and every tensor name, shape and
 storage dtype against the architecture, and rejects missing, duplicated,
 unexpected, overlapping, truncated or mis-shaped tensors and unknown format
-versions with a specific error message. A connected VAE must have the FLUX.1
-architecture, 8x compression, 16 latent channels and the FLUX.1 encoder weights
-(architecturally identical VAEs with a different latent space, such as the SD3
-VAE, are rejected); it must run in bf16 or fp32. The connected VAE is only read,
-never modified, so other branches of the workflow that use it are unaffected.
+versions with a specific error message. The VAE latent scale in the checkpoint
+metadata must be the FLUX.1 value 0.3611.
+
+A connected VAE must have the FLUX.1 architecture, 8x compression and 16 latent
+channels, and run in bf16 or fp32. Its weights are identified in two steps:
+
+- a sampled fingerprint of three encoder tensors must match FLUX.1. This
+  rejects architecturally identical VAEs with a different latent space, such as
+  the SD3 VAE;
+- a SHA-256 digest of the complete encoder and of the complete decoder, with
+  values rounded to bf16 (so the fp32 `ae.safetensors` and its bf16 copies hash
+  identically), is compared with FLUX.1. A VAE that passes the fingerprint but
+  differs here (modified weights, a copy stored in a lower precision, or a
+  fine-tuned decoder) is used with a warning in the log that the results are not
+  qualified.
+
+The digests are computed once per loaded VAE (about 0.1–0.3 s on CPU) and
+reused until its weights change. The connected VAE is only read, never
+modified, so other branches of the workflow that use it are unaffected.
 
 ## Nodes
 
@@ -229,6 +243,12 @@ very large overlaps only multiply the work.
   quarter of the free VRAM after the tile batch, otherwise in system RAM; `cpu`
   always uses system RAM (also with `--gpu-only`). Normalising and copying to
   the output happens in row chunks without a second full-size buffer.
+- **Output.** The FP32 RGB output (12 bytes per output pixel and image) is
+  allocated on ComfyUI's intermediate device. When that is the GPU (for example
+  with `--gpu-only`) it is included in the memory reserved before the run and
+  in the automatic tile batch. If it does not fit, it is kept in system RAM
+  instead (with a warning); appending the alpha channel and converting to
+  ComfyUI's output dtype fall back to system RAM the same way.
 - **Batches of images** share one tile queue, so small images are batched
   across image boundaries. With an explicit `tile_batch_size`, working memory
   is reserved only for as many tiles as there are.
@@ -240,7 +260,10 @@ this package yet. For orientation only, the official repository reports median
 times on an NVIDIA H100 80 GB (bf16, tile batch 1): 1024²→2048² 2.78 s,
 1024²→4096² 7.80 s, 2048²→8192² 37.5 s. `scripts/benchmark.py` measures load
 time, warm latency, per-stage time, tile throughput and peak memory on your own
-hardware.
+hardware. It reports PyTorch allocator peaks and device-wide memory in use
+(sampled from the driver, including allocations outside PyTorch's allocator,
+such as those of dynamic VRAM) separately; compare standard and dynamic model
+patchers with the device-wide figures.
 
 ## Precision
 
@@ -364,6 +387,8 @@ configured and are not qualified.
   Load VAE node with `ae.safetensors` connected to the upscale node.
 - **"incompatible VAE"**: the connected VAE is not the FLUX.1 VAE (for example an
   SD1/SDXL, SD3 or FLUX.2 VAE). Select `ae.safetensors` in Load VAE.
+- **Warning "encoder/decoder ... not qualified"**: the VAE resembles FLUX.1 but
+  its weights are not identical to it. Use the original `ae.safetensors`.
 - **Out of memory with a single tile**: free VRAM, use `--lowvram`, or set
   `accumulation_device` to `cpu`.
 - **Colours differ from the official command line tool**: ComfyUI's Load Image

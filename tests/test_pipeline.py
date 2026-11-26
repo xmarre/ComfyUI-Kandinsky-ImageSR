@@ -399,3 +399,44 @@ def test_images_with_unusual_strides_reach_the_vae_as_nchw():
     out, _ = TiledRestorer(FakeBackend(), grid).run(image, _opts(2))  # FakeBackend asserts NCHW input
     expected, _ = TiledRestorer(FakeBackend(), grid).run(image.clone(memory_format=torch.contiguous_format), _opts(2))
     assert torch.equal(out, expected)
+
+
+def test_output_that_does_not_fit_on_the_device_is_kept_in_system_memory(monkeypatch):
+    images = _images(1, 64, 64)
+    grid = make_grid(64, 64, 2, TILE, 0.25)
+    expected, _ = TiledRestorer(FakeBackend(), grid).run(images, _opts(1))
+    real = pl._empty
+
+    def empty(shape, device):
+        if torch.device(device).type != "cpu":
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory (output)")
+        return real(shape, device)
+
+    monkeypatch.setattr(pl, "_empty", empty)
+    out, _ = TiledRestorer(FakeBackend(), grid).run(images, _opts(1, output_device=torch.device("meta")))
+    assert out.device.type == "cpu" and torch.equal(out, expected)
+
+
+def test_exception_does_not_keep_tile_or_accumulator_storage_alive(monkeypatch):
+    """A failure inside a helper must not pin device buffers through its traceback frames."""
+    import gc
+    import weakref
+
+    refs = []
+
+    def failing_commit(self, units, prepared, accumulators):
+        buffer = accumulators[units[0][0]].buffer
+        decoded = prepared[0]
+        refs.extend([weakref.ref(buffer), weakref.ref(decoded)])
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(TiledRestorer, "_commit", failing_commit)
+    grid = make_grid(64, 64, 2, TILE, 0.25)
+    error = None
+    try:
+        TiledRestorer(FakeBackend(), grid).run(_images(1, 64, 64), _opts(1))
+    except RuntimeError as caught:
+        error = caught
+    assert error is not None and error.__traceback__ is not None  # the caller still holds the exception
+    gc.collect()
+    assert refs and all(r() is None for r in refs)
