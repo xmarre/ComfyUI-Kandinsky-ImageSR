@@ -35,6 +35,8 @@ TIMESTEP_MATCH_TOLERANCE = 1e-6
 #: The VAE is the FLUX.1 autoencoder: 8x spatial compression, 16 latent channels.
 VAE_SPATIAL_COMPRESSION = 8
 LATENT_CHANNELS = 16
+#: Latent scale of the FLUX.1 VAE that ImageSR applies (no shift); the transformer was trained with it.
+VAE_SCALING_FACTOR = 0.3611
 
 #: Default fraction of each low-resolution tile that overlaps its neighbour.
 DEFAULT_OVERLAP = 0.25
@@ -264,6 +266,11 @@ def validate_vae_config(cfg: dict[str, Any]) -> float:
     _require(
         isinstance(scale, (int, float)) and not isinstance(scale, bool) and math.isfinite(scale) and scale > 0,
         f"invalid VAE scaling_factor {scale!r}",
+    )
+    _require(
+        math.isclose(scale, VAE_SCALING_FACTOR, rel_tol=0, abs_tol=1e-9),
+        f"VAE scaling_factor {scale!r} is not the FLUX.1 latent scale {VAE_SCALING_FACTOR} that the model was "
+        "trained with",
     )
     return float(scale)
 

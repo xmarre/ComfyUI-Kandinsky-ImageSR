@@ -16,6 +16,9 @@ decoding runs under CUDA autocast when the VAE dtype is FP16/BF16 (the official
 from __future__ import annotations
 
 import functools
+import hashlib
+import logging
+import weakref
 from contextlib import nullcontext
 from typing import Any
 
@@ -111,18 +114,66 @@ class IncompatibleVAEError(ValueError):
     """The connected VAE cannot be used with Kandinsky ImageSR."""
 
 
+def bf16_digest(state: dict[str, torch.Tensor], prefix: str) -> str:
+    """SHA-256 of every ``prefix`` tensor (names, shapes, values rounded to BF16).
+
+    BF16 rounding makes the digest independent of whether ComfyUI holds the VAE in
+    FP32 or BF16: the FP32 FLUX.1 weights and their BF16 copy hash identically.
+    """
+    digest = hashlib.sha256()
+    for name in sorted(n for n in state if n.startswith(prefix)):
+        tensor = state[name].detach()
+        digest.update(f"{name}:{tuple(tensor.shape)};".encode())
+        values = tensor.to(dtype=torch.bfloat16).contiguous().cpu().view(torch.int16)
+        digest.update(values.numpy().tobytes())
+    return digest.hexdigest()
+
+
+#: Per autoencoder: weight identity token -> (encoder digest, decoder digest).
+_DIGEST_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _version(tensor: torch.Tensor) -> int | None:
+    try:
+        return tensor._version  # noqa: SLF001
+    except RuntimeError:  # inference tensors (ComfyUI executes nodes under inference mode) have no counter
+        return None
+
+
+def _weights_token(state: dict[str, torch.Tensor]) -> tuple:
+    """Changes when a weight is replaced, moved, cast, or (outside inference mode) modified in place."""
+    return tuple((n, t.data_ptr(), _version(t), t.dtype, str(t.device)) for n, t in state.items())
+
+
+def _cached_digests(model: torch.nn.Module, state: dict[str, torch.Tensor]) -> tuple[str, str]:
+    """Digests of the encoder and decoder; recomputed only when the weights change."""
+    token = _weights_token(state)
+    cached = _DIGEST_CACHE.get(model)
+    if cached is None or cached[0] != token:
+        cached = (token, (bf16_digest(state, "encoder."), bf16_digest(state, "decoder.")))
+        _DIGEST_CACHE[model] = cached
+    return cached[1]
+
+
 def validate_imagesr_vae(vae: object) -> None:
     """Check that ``vae`` (a ``comfy.sd.VAE``) is the FLUX.1 autoencoder this model needs.
 
-    Architecture, latent layout and normalisation are checked structurally; the
-    encoder weights must match the FLUX.1 VAE (the latent space the model was
-    trained in), so architecturally identical VAEs such as the SD3 VAE are
-    rejected. A decoder that differs from FLUX.1 is accepted with a warning (for
-    example a fine-tuned decoder) because it does not change the latent space.
-    Nothing on the object is modified.
-    """
-    import logging
+    Architecture, latent layout and normalisation are checked structurally. The
+    encoder defines the latent space the model was trained in, so its weights are
+    identified in two steps:
 
+    * a sampled fingerprint of three encoder tensors must match FLUX.1, which
+      rejects architecturally identical VAEs with a different latent space (for
+      example the SD3 VAE);
+    * a SHA-256 digest of the complete encoder, rounded to BF16, is compared with
+      the FLUX.1 VAE. A VAE that passes the fingerprint but differs here (a
+      modified encoder, or a copy that was stored in a lower precision) is
+      accepted with a warning that the results are not qualified.
+
+    The decoder does not change the latent space; a decoder differing from FLUX.1
+    (for example a fine-tuned one) is accepted with a warning. Digests are cached
+    per VAE until its weights change. Nothing on the object is modified.
+    """
     import comfy.ldm.models.autoencoder as autoencoder
 
     hint = "Connect the FLUX.1 VAE (ae.safetensors) from a Load VAE node."
@@ -164,15 +215,21 @@ def validate_imagesr_vae(vae: object) -> None:
 
     reference = load_reference_fingerprint()
     state = model.state_dict(keep_vars=True)
-    for part, names in FINGERPRINT_TENSORS.items():
-        matches = all(_fingerprint_matches(tensor_fingerprint(state[n]), reference[n]) for n in names)
-        if matches:
-            continue
-        if part == "encoder":
-            raise IncompatibleVAEError(
-                "the VAE has the FLUX architecture but its encoder weights are not those of the FLUX.1 VAE "
-                f"(for example the SD3 VAE has the same layout and a different latent space). {hint}"
-            )
-        logging.getLogger(__name__).warning(
+    encoder_names = FINGERPRINT_TENSORS["encoder"]
+    if not all(_fingerprint_matches(tensor_fingerprint(state[n]), reference[n]) for n in encoder_names):
+        raise IncompatibleVAEError(
+            "the VAE has the FLUX architecture but its encoder weights are not those of the FLUX.1 VAE "
+            f"(for example the SD3 VAE has the same layout and a different latent space). {hint}"
+        )
+    log = logging.getLogger(__name__)
+    encoder_digest, decoder_digest = _cached_digests(model, state)
+    if encoder_digest != reference["sha256_bf16"]["encoder"]:
+        log.warning(
+            "Kandinsky ImageSR: the connected VAE's encoder is close to, but not identical with, the FLUX.1 VAE "
+            "(modified weights or a lower-precision copy); results are not qualified. %s",
+            hint,
+        )
+    if decoder_digest != reference["sha256_bf16"]["decoder"]:
+        log.warning(
             "Kandinsky ImageSR: the connected VAE's decoder differs from the FLUX.1 VAE; results are not qualified"
         )

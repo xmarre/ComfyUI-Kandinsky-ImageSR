@@ -122,6 +122,8 @@ def test_vae_config():
         ("latent_channels", 4, "latent channels"),
         ("_class_name", "AutoencoderKLWan", "AutoencoderKL"),
         ("scaling_factor", 0, "scaling_factor"),
+        ("scaling_factor", 0.18215, "FLUX.1 latent scale"),
+        ("scaling_factor", 0.3612, "FLUX.1 latent scale"),
         ("use_quant_conv", True, "quant"),
         ("block_out_channels", [128, 256, 512], "four"),
     ]:

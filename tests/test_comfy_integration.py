@@ -68,6 +68,7 @@ def env(comfy, tmp_path_factory):
     for names in test_vae_module.FINGERPRINT_TENSORS.values():
         for n in names:
             reference[n] = test_vae_module.tensor_fingerprint(sd[n])
+    reference["sha256_bf16"] = {part: test_vae_module.bf16_digest(sd, f"{part}.") for part in ("encoder", "decoder")}
     originals = []
     for mod in (module("vae"), test_vae_module):
         originals.append((mod, mod.load_reference_fingerprint))
@@ -476,6 +477,87 @@ def test_incompatible_vaes_are_rejected(env):
     sd1["encoder.conv_out.bias"] = torch.zeros(8)
     with pytest.raises(vae_module.IncompatibleVAEError, match="latent channels"):
         _run(env, single, _image(), vae=comfy.sd.VAE(sd=sd1, dtype=torch.float32))
+
+
+def _vae_with(env, edit):
+    import comfy.sd
+
+    state = {k: v.clone() for k, v in env["load_vae"](torch.float32).first_stage_model.state_dict().items()}
+    edit(state)
+    return comfy.sd.VAE(sd=state, dtype=torch.float32)
+
+
+def _flip_sign(name, index):
+    def edit(state):
+        state[name].view(-1)[index] *= -1
+
+    return edit
+
+
+@pytest.mark.parametrize(
+    "edit,part",
+    [
+        # unsampled element of a fingerprinted tensor: same samples, same sum of squares
+        (_flip_sign("encoder.conv_in.weight", 1), "encoder"),
+        # tensor outside the sampled fingerprint
+        (_flip_sign("encoder.down.1.block.0.conv1.weight", 0), "encoder"),
+        (_flip_sign("decoder.up.0.block.0.conv2.weight", 0), "decoder"),
+    ],
+)
+def test_vae_weight_changes_invisible_to_the_fingerprint_are_reported(env, caplog, edit, part):
+    import logging
+
+    vae_module = env["module"]("vae")
+    vae = _vae_with(env, edit)
+    reference = vae_module.load_reference_fingerprint()
+    state = vae.first_stage_model.state_dict()
+    assert all(
+        vae_module._fingerprint_matches(vae_module.tensor_fingerprint(state[n]), reference[n])
+        for n in vae_module.FINGERPRINT_TENSORS[part]
+    )
+    with caplog.at_level(logging.WARNING):
+        vae_module.validate_imagesr_vae(vae)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and f"{part} " in warnings[0] and "not qualified" in warnings[0]
+
+
+def test_canonical_vae_validates_silently_in_both_precisions(env, caplog):
+    import logging
+
+    vae_module = env["module"]("vae")
+    with caplog.at_level(logging.WARNING):
+        for dtype in (torch.float32, torch.bfloat16):
+            vae = env["load_vae"](dtype)
+            vae_module.validate_imagesr_vae(vae)
+            vae_module.validate_imagesr_vae(vae)  # cached digest
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_vae_validation_with_inference_tensors(env, caplog):
+    """ComfyUI loads and runs nodes under inference mode; its tensors have no version counter."""
+    import logging
+
+    vae_module = env["module"]("vae")
+    with torch.inference_mode():
+        vae = env["load_vae"](torch.float32)
+        with caplog.at_level(logging.WARNING):
+            vae_module.validate_imagesr_vae(vae)
+    vae_module.validate_imagesr_vae(vae)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_vae_digest_cache_follows_in_place_weight_changes(env, caplog):
+    import logging
+
+    vae_module = env["module"]("vae")
+    vae = env["load_vae"](torch.float32)
+    vae_module.validate_imagesr_vae(vae)
+    weight = vae.first_stage_model.encoder.down[1].block[0].conv1.weight
+    with torch.no_grad():
+        weight.view(-1)[0] *= -1
+    with caplog.at_level(logging.WARNING):
+        vae_module.validate_imagesr_vae(vae)
+    assert any("encoder" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
 
 
 def test_connected_vae_is_not_mutated_and_not_retained(env):

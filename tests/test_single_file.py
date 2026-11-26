@@ -95,6 +95,10 @@ def _meta(edit):
         (lambda m: m.__setitem__("vae_config", "{not json"), "not valid JSON"),
         (lambda m: m.__setitem__("model_index", "[1, 2]"), "JSON object"),
         (
+            lambda m: m.__setitem__("vae_config", json.dumps({**json.loads(m["vae_config"]), "scaling_factor": 0.5})),
+            "FLUX.1 latent scale",
+        ),
+        (
             lambda m: m.__setitem__(
                 "transformer_config", json.dumps({**json.loads(m["transformer_config"]), "visual_cond": True})
             ),
