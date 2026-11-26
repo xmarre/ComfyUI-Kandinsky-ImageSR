@@ -77,6 +77,18 @@ def runs_from_args(args) -> list[dict]:
 # ----------------------------------------------------------------------------- reference phase
 
 
+def _cpu_autocast(device: torch.device):
+    """On CPU, emulate the official CUDA path, which runs the transformer under bf16 autocast.
+
+    Without it the official pipeline on CPU computes the modulation projections in
+    FP32, which is not what it does on GPUs. CPU autocast applies the same casts to
+    the operations involved (linear layers, SDPA); the VAE weights are bf16 already.
+    """
+    from contextlib import nullcontext
+
+    return torch.autocast("cpu", dtype=torch.bfloat16) if device.type == "cpu" else nullcontext()
+
+
 def phase_reference(args) -> None:
     from kandinsky_image_sr import KandinskyImageSRPipeline
 
@@ -109,7 +121,10 @@ def phase_reference(args) -> None:
         pipe._encode, pipe._decode, pipe.transformer.forward = _encode, _decode, _forward
         start = time.perf_counter()
         try:
-            output = pipe(image[0], upscale_factor=run["factor"], creativity=run["creativity"], output_type="pt").images
+            with _cpu_autocast(device):
+                output = pipe(
+                    image[0], upscale_factor=run["factor"], creativity=run["creativity"], output_type="pt"
+                ).images
         finally:
             pipe._encode, pipe._decode, pipe.transformer.forward = encode, decode, forward
         record["runs"].append({**run, **stages, "output": output.float().cpu(), "seconds": time.perf_counter() - start})
@@ -121,9 +136,7 @@ def phase_reference(args) -> None:
     latent = first.permute(0, 2, 3, 1).unsqueeze(1)
     size = first.shape[-1] // 2
     pos = (torch.arange(1, device=device), torch.arange(size, device=device), torch.arange(size, device=device))
-    autocast = (
-        torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else torch.autocast("cpu", enabled=False)
-    )
+    autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else _cpu_autocast(device)
     for factor, values in CREATIVITY.items():
         for level, t in enumerate(values):
             with autocast:
