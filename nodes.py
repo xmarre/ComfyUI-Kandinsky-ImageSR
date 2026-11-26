@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 from comfy_api.latest import ComfyExtension, io
@@ -27,6 +28,15 @@ FACTOR_OPTIONS = {"2x": 2, "4x": 4}
 CATEGORY = "image/upscaling/Kandinsky ImageSR"
 
 
+_SCHEMA_FIELDS = {f.name for f in dataclasses.fields(io.Schema)} if dataclasses.is_dataclass(io.Schema) else set()
+
+
+def _schema(**kwargs) -> io.Schema:
+    """Build a schema, dropping optional fields older ComfyUI releases do not know."""
+    optional = ("search_aliases",)
+    return io.Schema(**{k: v for k, v in kwargs.items() if k not in optional or k in _SCHEMA_FIELDS})
+
+
 def _search_roots() -> list[str]:
     import folder_paths
 
@@ -41,7 +51,7 @@ def _bundle_names() -> list[str]:
 class KandinskyImageSRLoader(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
-        return io.Schema(
+        return _schema(
             node_id="KandinskyImageSRLoader",
             display_name="Kandinsky ImageSR Loader",
             category=CATEGORY,
@@ -96,7 +106,7 @@ class KandinskyImageSRLoader(io.ComfyNode):
 class KandinskyImageSRUpscale(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
-        return io.Schema(
+        return _schema(
             node_id="KandinskyImageSRUpscale",
             display_name="Kandinsky ImageSR Upscale",
             category=CATEGORY,

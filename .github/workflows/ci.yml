@@ -13,7 +13,7 @@ concurrency:
 env:
   # Pinned ComfyUI compatibility target (release tag) and the oldest supported release.
   COMFYUI_PINNED: v0.46.3
-  COMFYUI_MINIMUM: v0.8.0
+  COMFYUI_MINIMUM: v0.3.50
 
 jobs:
   lint:

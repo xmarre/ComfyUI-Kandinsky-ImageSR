@@ -91,7 +91,7 @@ def comfy_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: in
     """ComfyUI optimized attention dispatch (respects the configured backend)."""
     from comfy.ldm.modules.attention import optimized_attention
 
-    return optimized_attention(q, k, v, heads, skip_reshape=True, transformer_options={})
+    return optimized_attention(q, k, v, heads, skip_reshape=True)
 
 
 # --------------------------------------------------------------------------- functional pieces
