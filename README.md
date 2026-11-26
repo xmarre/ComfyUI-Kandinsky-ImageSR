@@ -319,26 +319,30 @@ never touches the ComfyUI environment.
 
 Measured on CPU (PyTorch 2.15, bf16 weights and VAE) against the official
 pipeline with its transformer under bf16 autocast, the mode the official CUDA
-path uses. ComfyUI was run with `--use-pytorch-cross-attention` (ComfyUI's
-default on current CUDA setups). Inputs were public-domain/CC0 photographs.
+path uses, fed a PIL image as in the official command line and demo. ComfyUI was
+run with `--use-pytorch-cross-attention` (ComfyUI's default on current CUDA
+setups). Input: a 200x300 public-domain photograph (one tile at 2x, four tiles
+at 4x).
 
 | Stage | Result |
 |---|---|
 | Bicubic tiles fed to the VAE | bitwise identical |
-| Transformer velocity, identical latents, all 18 creativity presets | **bitwise identical** |
+| Transformer velocity, identical latents, all 18 creativity presets | **bitwise identical** (bundle and single-file checkpoint) |
 | VAE encoder, fp32, ComfyUI vs Diffusers implementation | relative RMS 8.7e-8 |
-| VAE encoder, bf16, same batch size | relative RMS ≈ 1e-3 (different bf16 kernels) |
-| Final image, tile batch 1 (3 cases: 2x c4, 4x c0, 4x c8) | PSNR 53.6 / 53.5 / 46.5 dB vs. official output |
-| Final image, tile batch 2 here vs. 1 in the reference (2x c4) | PSNR 48.9 dB |
+| Encoded latents, bf16 VAE | relative RMS 1.1–1.3e-3 (different bf16 kernels) |
+| Final image, 2x, creativity 0 / 4 / 8 | PSNR 55.3 / 51.7 / 45.1 dB vs. official output |
+| Final image, 4x, creativity 0 / 4 / 8, tile batch 1 | PSNR 53.8 / 50.4 / 46.5 dB |
+| Final image, 4x, creativity 0 / 4 / 8, tile batch 2 | PSNR 53.7 / 50.6 / 46.5 dB |
+| Single-file checkpoint + `ae.safetensors` (bf16) vs. official bundle | identical results in every case |
 
 The remaining end-to-end difference is bf16 rounding in the VAE, amplified by
-the transformer: a 1e-3 relative change of the latents changes the velocity by
-1.5–6 %. The bf16 VAE is intrinsically sensitive (bf16 vs. fp32 encoding of the
-same tile differs by about 5 % relative RMS). The tile batch size changes which
-bf16 kernels run, so it changes results at this level too (latent difference
-0.1 % at equal batch size, 2.3 % at batch 2 vs. 1); the official pipeline is
-subject to the same mechanism. These figures are CPU measurements; CUDA parity
-is checked with the script above.
+the transformer: a latent difference of about 1e-3 relative RMS becomes a
+velocity difference of 1.6–2.4 % relative RMS in these runs. The bf16 VAE is
+intrinsically sensitive (bf16 vs. fp32 encoding of the same tile differs by
+about 5 % relative RMS), and the tile batch size changes which bf16 kernels run,
+which explains the small differences between tile batch 1 and 2; the official
+pipeline is subject to the same mechanism. These figures are CPU measurements;
+CUDA parity is checked with the script above.
 
 Attention backend matters: ComfyUI's split/sub-quadratic/basic attention compute
 scores in bf16 unless asked to upcast; this package requests FP32 score
