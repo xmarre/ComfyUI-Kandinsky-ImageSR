@@ -384,3 +384,18 @@ def test_buffers_are_released_after_finalisation_and_on_cancellation(monkeypatch
         tb = tb.tb_next
     run_frame = next(f for f in frames if f.f_code.co_name == "run")
     assert run_frame.f_locals.get("output") is None
+
+
+def test_images_with_unusual_strides_reach_the_vae_as_nchw():
+    """IMAGE tensors made by permuting NCHW data (size-1 batch, odd strides) must not leak their layout."""
+    # smaller than one tile: the tile is the whole image, whose channels-last layout
+    # would otherwise survive padding and interpolation
+    hwc = _images(1, 40, 50)[0].contiguous()
+    nchw = hwc.permute(2, 0, 1)[None]  # e.g. an image decoded to HWC and converted to NCHW
+    image = nchw.permute(0, 2, 3, 1).contiguous()  # no copy: (1, H, W, 3) with batch stride 3
+    assert image.stride(0) == 3
+    assert image.movedim(-1, 1).is_contiguous(memory_format=torch.channels_last)
+    grid = make_grid(40, 50, 2, TILE, 0.25)
+    out, _ = TiledRestorer(FakeBackend(), grid).run(image, _opts(2))  # FakeBackend asserts NCHW input
+    expected, _ = TiledRestorer(FakeBackend(), grid).run(image.clone(memory_format=torch.contiguous_format), _opts(2))
+    assert torch.equal(out, expected)

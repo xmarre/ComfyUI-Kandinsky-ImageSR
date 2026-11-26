@@ -121,7 +121,9 @@ class TiledRestorer:
             # memory; that layout would propagate through interpolation into the VAE,
             # where reduced-precision convolutions select different kernels and the
             # latents measurably diverge from the reference.
-            tile = tile.to(device=device, dtype=torch.float32, memory_format=torch.contiguous_format)
+            # ``Tensor.to(memory_format=...)`` returns views with unusual strides unchanged
+            # (e.g. a permuted size-1 batch dimension), so make the copy explicit.
+            tile = tile.to(device=device, dtype=torch.float32).contiguous()
             tile = tile.clamp(0.0, 1.0)  # the reference clamps its input to [0, 1]
             pad_h = size - (bottom - top)
             pad_w = size - (right - left)
