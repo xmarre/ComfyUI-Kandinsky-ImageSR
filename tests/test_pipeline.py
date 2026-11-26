@@ -28,6 +28,8 @@ class FakeBackend:
         self.calls["encode"] += 1
         self.batch_sizes.append(pixels.shape[0])
         assert pixels.dtype == torch.float32 and pixels.shape[-1] == TILE
+        # reduced-precision VAE kernels depend on memory layout; the reference feeds NCHW
+        assert pixels.is_contiguous(memory_format=torch.contiguous_format)
         assert float(pixels.min()) >= 0 and float(pixels.max()) <= 1
         z = F.avg_pool2d(pixels * 2 - 1, 8)
         return torch.cat([z, z.square(), torch.zeros_like(z).repeat(1, 3, 1, 1)[:, :10]], dim=1)

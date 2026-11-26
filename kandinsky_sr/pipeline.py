@@ -116,7 +116,12 @@ class TiledRestorer:
             # image border, so pad per tile instead of materialising a padded image.
             bottom = min(top + size, g.height)
             right = min(left + size, g.width)
-            tile = image[:, top:bottom, left:right, :].movedim(-1, 1).to(device=device, dtype=torch.float32)
+            tile = image[:, top:bottom, left:right, :].movedim(-1, 1)
+            # NCHW-contiguous like the reference. ComfyUI images are channels-last in
+            # memory; that layout would propagate through interpolation into the VAE,
+            # where reduced-precision convolutions select different kernels and the
+            # latents measurably diverge from the reference.
+            tile = tile.to(device=device, dtype=torch.float32, memory_format=torch.contiguous_format)
             tile = tile.clamp(0.0, 1.0)  # the reference clamps its input to [0, 1]
             pad_h = size - (bottom - top)
             pad_w = size - (right - left)
@@ -133,6 +138,8 @@ class TiledRestorer:
         pixels = F.interpolate(lq, size=(g.tile_size, g.tile_size), mode="bicubic", align_corners=False)
         del lq
         pixels = pixels.clamp_(0.0, 1.0)
+        if not pixels.is_contiguous():
+            raise RuntimeError("internal error: VAE input must be NCHW-contiguous")
         self._check_interrupt(opts)
         latents = backend.encode(pixels)
         del pixels
