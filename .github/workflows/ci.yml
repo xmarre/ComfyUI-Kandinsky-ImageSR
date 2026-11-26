@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned ComfyUI compatibility target (release tag) and the oldest supported release.
+  COMFYUI_PINNED: v0.46.3
+  COMFYUI_MINIMUM: v0.8.0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.11.13
+      - run: ruff check .
+      - run: python -m compileall -q .
+
+  unit:
+    # Pure-PyTorch tests (no ComfyUI). ComfyUI tests are reported as skipped.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install safetensors numpy pillow pytest
+      - run: python -m pytest -q
+
+  comfyui:
+    # Full suite against a real ComfyUI checkout in CPU mode.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - comfyui: pinned
+            python: "3.12"
+          - comfyui: minimum
+            python: "3.10"
+          - comfyui: master
+            python: "3.12"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Select ComfyUI revision
+        shell: bash
+        run: |
+          case "${{ matrix.comfyui }}" in
+            pinned) echo "REF=$COMFYUI_PINNED" >> "$GITHUB_ENV" ;;
+            minimum) echo "REF=$COMFYUI_MINIMUM" >> "$GITHUB_ENV" ;;
+            master) echo "REF=master" >> "$GITHUB_ENV" ;;
+          esac
+      - name: Check out ComfyUI ${{ env.REF }}
+        run: git clone --depth 1 --branch "$REF" https://github.com/Comfy-Org/ComfyUI "$RUNNER_TEMP/ComfyUI"
+      - run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r "$RUNNER_TEMP/ComfyUI/requirements.txt" pytest
+      - name: Test
+        run: |
+          git -C "$RUNNER_TEMP/ComfyUI" log -1 --format='ComfyUI %H %s'
+          COMFYUI_PATH="$RUNNER_TEMP/ComfyUI" python -m pytest -q

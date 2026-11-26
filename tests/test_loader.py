@@ -104,8 +104,10 @@ def test_unexpected_key(bundle):
     state = load_file(str(shard))
     state["visual_transformer_blocks.0.cross_attention.to_key.weight"] = torch.zeros(4, 4, dtype=torch.bfloat16)
     save_file(state, str(shard))
-    _edit_json(bundle / INDEX, lambda i: i["weight_map"].__setitem__(
-        "visual_transformer_blocks.0.cross_attention.to_key.weight", shard.name))
+    _edit_json(
+        bundle / INDEX,
+        lambda i: i["weight_map"].__setitem__("visual_transformer_blocks.0.cross_attention.to_key.weight", shard.name),
+    )
     with pytest.raises(BundleError, match="unexpected"):
         inspect_bundle(bundle)
 
@@ -185,7 +187,10 @@ def test_unsupported_architecture(bundle):
 
 
 def test_wrong_component_in_model_index(bundle):
-    _edit_json(bundle / "model_index.json", lambda i: i.__setitem__("transformer", ["diffusers", "Kandinsky5Transformer3DModel"]))
+    _edit_json(
+        bundle / "model_index.json",
+        lambda i: i.__setitem__("transformer", ["diffusers", "Kandinsky5Transformer3DModel"]),
+    )
     with pytest.raises(BundleError, match="component"):
         inspect_bundle(bundle)
 

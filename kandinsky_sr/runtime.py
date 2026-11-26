@@ -103,7 +103,9 @@ def _load_vae(bundle: BundleInfo, dtype: torch.dtype) -> object:
     return vae
 
 
-def load_model(path: str | Path, name: str, weight_dtype: str = "default", vae_dtype: str = "default") -> KandinskySRModel:
+def load_model(
+    path: str | Path, name: str, weight_dtype: str = "default", vae_dtype: str = "default"
+) -> KandinskySRModel:
     import comfy.model_management as mm
     import comfy.model_patcher
 
@@ -136,7 +138,11 @@ def load_model(path: str | Path, name: str, weight_dtype: str = "default", vae_d
     vae = _load_vae(bundle, _resolve_vae_dtype(vae_dtype, mm.vae_device()))
     logger.info(
         "Kandinsky ImageSR loaded %s: transformer %s on %s, VAE %s on %s",
-        name, dtype, load_device, vae.vae_dtype, vae.device,
+        name,
+        dtype,
+        load_device,
+        vae.vae_dtype,
+        vae.device,
     )
     return KandinskySRModel(name, bundle, model, patcher, vae, dtype)
 
@@ -234,8 +240,19 @@ def upscale(
     logger.info(
         "Kandinsky ImageSR: %d image(s) %dx%d -> %dx%d, %d tiles (%dx%d grid), t=%s, tile batch %d "
         "(~%s per tile), accumulator %s on %s",
-        batch, width, height, grid.out_width, grid.out_height, total_tiles, grid.cols, grid.rows, timestep,
-        batch_size, format_bytes(per_tile), format_bytes(acc_bytes), acc_device,
+        batch,
+        width,
+        height,
+        grid.out_width,
+        grid.out_height,
+        total_tiles,
+        grid.cols,
+        grid.rows,
+        timestep,
+        batch_size,
+        format_bytes(per_tile),
+        format_bytes(acc_bytes),
+        acc_device,
     )
 
     pbar = comfy.utils.ProgressBar(total_tiles)

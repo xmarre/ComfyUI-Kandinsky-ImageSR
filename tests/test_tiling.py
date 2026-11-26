@@ -66,8 +66,8 @@ def test_separable_weights_equal_accumulated_reference_weights(h, w, factor):
     g = make_grid(h, w, factor, 1024, 0.25)
     full = torch.zeros(g.padded_out_height, g.padded_out_width)
     for r, c in g.cells():
-        t, l = g.tops[r] * factor, g.lefts[c] * factor
-        full[t : t + 1024, l : l + 1024] += g.window(r, c)
+        top, left = g.tops[r] * factor, g.lefts[c] * factor
+        full[top : top + 1024, left : left + 1024] += g.window(r, c)
     wy, wx = g.weight_profiles()
     torch.testing.assert_close(wy[:, None] * wx[None, :], full, rtol=2e-6, atol=0)
     assert bool((full > 0).all())

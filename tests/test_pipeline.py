@@ -50,8 +50,9 @@ def _images(batch, h, w, seed=0):
 
 
 def _opts(batch_size=1, t=0.15, index=5, **kw):
-    return RunOptions(timestep=t, timestep_index=index, tile_batch_size=batch_size,
-                      accumulation_device=torch.device("cpu"), **kw)
+    return RunOptions(
+        timestep=t, timestep_index=index, tile_batch_size=batch_size, accumulation_device=torch.device("cpu"), **kw
+    )
 
 
 def _oracle(image_hwc, factor, overlap=0.25, t=0.15, index=5):
@@ -61,12 +62,15 @@ def _oracle(image_hwc, factor, overlap=0.25, t=0.15, index=5):
         lq = backend.encode(pixels)
         return backend.decode(lq - t * backend.transform(lq, index))
 
-    out = ref.reference_tiled_call(image_hwc.permute(2, 0, 1)[None], infer, upscale_factor=factor,
-                                   tile_size=TILE, overlap=overlap)
+    out = ref.reference_tiled_call(
+        image_hwc.permute(2, 0, 1)[None], infer, upscale_factor=factor, tile_size=TILE, overlap=overlap
+    )
     return out[0].permute(1, 2, 0)
 
 
-@pytest.mark.parametrize("h,w,factor", [(64, 64, 2), (40, 50, 2), (17, 200, 4), (150, 90, 2), (97, 131, 4), (64, 192, 2)])
+@pytest.mark.parametrize(
+    "h,w,factor", [(64, 64, 2), (40, 50, 2), (17, 200, 4), (150, 90, 2), (97, 131, 4), (64, 192, 2)]
+)
 @pytest.mark.parametrize("batch_size", [1, 3])
 def test_matches_upstream_tile_loop(h, w, factor, batch_size):
     images = _images(1, h, w)

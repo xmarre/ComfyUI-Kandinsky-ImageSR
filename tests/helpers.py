@@ -60,8 +60,15 @@ def reference_model(config_dict: dict, state: dict[str, torch.Tensor]):
     return model.eval()
 
 
-def write_bundle(root: Path, transformer_cfg: dict | None = None, vae_cfg: dict | None = None, *, shards: int = 2,
-                 seed: int = 0, tile_size: int | None = None) -> Path:
+def write_bundle(
+    root: Path,
+    transformer_cfg: dict | None = None,
+    vae_cfg: dict | None = None,
+    *,
+    shards: int = 2,
+    seed: int = 0,
+    tile_size: int | None = None,
+) -> Path:
     """Write a synthetic bundle with the published file layout and random weights."""
     from safetensors.torch import save_file
 

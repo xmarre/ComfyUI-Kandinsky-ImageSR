@@ -74,13 +74,13 @@ def test_decode_autocast_only_on_cuda_half():
 
 @pytest.fixture(scope="module")
 def comfy_vae(comfy):
+    import tempfile
+    from pathlib import Path
+
     import comfy.sd
     from safetensors.torch import load_file
 
     from tests.helpers import published_vae_config, write_bundle
-
-    import tempfile
-    from pathlib import Path
 
     with tempfile.TemporaryDirectory() as tmp:
         root = write_bundle(Path(tmp) / "b", vae_cfg=published_vae_config(), shards=1)

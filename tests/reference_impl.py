@@ -221,14 +221,12 @@ class KandinskyImageSRBakedBlock(nn.Module):
         self.register_buffer("xattn_bias_table", torch.zeros(num_timesteps, model_dim, dtype=torch.float32))
 
     def forward(self, visual_embed, time_embed, rope, sparse_params, timestep_indices):
-        self_attn_params, _, ff_params = torch.chunk(
-            self.visual_modulation(time_embed).unsqueeze(dim=1), 3, dim=-1
-        )
+        self_attn_params, _, ff_params = torch.chunk(self.visual_modulation(time_embed).unsqueeze(dim=1), 3, dim=-1)
 
         shift, scale, gate = torch.chunk(self_attn_params, 3, dim=-1)
-        visual_out = (
-            self.self_attention_norm(visual_embed.float()) * (scale.float() + 1.0) + shift.float()
-        ).type_as(visual_embed)
+        visual_out = (self.self_attention_norm(visual_embed.float()) * (scale.float() + 1.0) + shift.float()).type_as(
+            visual_embed
+        )
         visual_out = self.self_attention(visual_out, rotary_emb=rope, sparse_params=sparse_params)
         visual_embed = (visual_embed.float() + gate.float() * visual_out.float()).type_as(visual_embed)
 
@@ -236,9 +234,9 @@ class KandinskyImageSRBakedBlock(nn.Module):
         visual_embed = (visual_embed.float() + baked_bias).type_as(visual_embed)
 
         shift, scale, gate = torch.chunk(ff_params, 3, dim=-1)
-        visual_out = (
-            self.feed_forward_norm(visual_embed.float()) * (scale.float() + 1.0) + shift.float()
-        ).type_as(visual_embed)
+        visual_out = (self.feed_forward_norm(visual_embed.float()) * (scale.float() + 1.0) + shift.float()).type_as(
+            visual_embed
+        )
         visual_out = self.feed_forward(visual_out)
         return (visual_embed.float() + gate.float() * visual_out.float()).type_as(visual_embed)
 
@@ -276,9 +274,7 @@ class KandinskyImageSRBakedTransformer3DModel(nn.Module):
             ]
         )
         self.out_layer = Kandinsky5OutLayer(model_dim, time_dim, out_visual_dim, patch_size)
-        self.register_buffer(
-            "time_embed_table", torch.zeros(len(self.baked_timesteps), time_dim, dtype=torch.float32)
-        )
+        self.register_buffer("time_embed_table", torch.zeros(len(self.baked_timesteps), time_dim, dtype=torch.float32))
 
     def _timestep_indices(self, timestep):
         requested = timestep.float() / 1000.0

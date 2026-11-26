@@ -59,7 +59,9 @@ class TileMemoryEstimate:
         return max(self.vae_encode, self.vae_decode, self.transformer) + self.io
 
 
-def auto_tile_batch(free_bytes: int, reserved_bytes: int, per_tile: int, num_tiles: int, cap: int = AUTO_BATCH_CAP) -> int:
+def auto_tile_batch(
+    free_bytes: int, reserved_bytes: int, per_tile: int, num_tiles: int, cap: int = AUTO_BATCH_CAP
+) -> int:
     usable = free_bytes - reserved_bytes
     by_memory = int(usable // per_tile) if per_tile > 0 else cap
     return max(1, min(cap, by_memory, num_tiles))

@@ -238,9 +238,7 @@ def _validate_transformer_shards(directory: Path, config: TransformerConfig) -> 
         if mapped != present:
             missing = sorted(mapped - present)
             extra = sorted(present - mapped)
-            raise BundleError(
-                f"shard {shard} does not match the index: missing {missing[:3]}, unexpected {extra[:3]}"
-            )
+            raise BundleError(f"shard {shard} does not match the index: missing {missing[:3]}, unexpected {extra[:3]}")
         for name in present:
             if name in tensors:
                 raise BundleError(f"tensor {name!r} appears in more than one shard")
@@ -258,11 +256,10 @@ def _validate_transformer_shards(directory: Path, config: TransformerConfig) -> 
             total_bytes += int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
 
     metadata = index.get("metadata")
-    if isinstance(metadata, dict) and "total_size" in metadata:
-        if int(metadata["total_size"]) != total_bytes:
-            raise BundleError(
-                f"transformer shards hold {total_bytes} bytes but the index declares {metadata['total_size']}"
-            )
+    if isinstance(metadata, dict) and "total_size" in metadata and int(metadata["total_size"]) != total_bytes:
+        raise BundleError(
+            f"transformer shards hold {total_bytes} bytes but the index declares {metadata['total_size']}"
+        )
     return tensors
 
 
@@ -339,7 +336,9 @@ def discover_bundles(search_roots: list[str]) -> dict[str, Path]:
             continue
         candidates: list[tuple[str, Path]] = []
         try:
-            children = sorted((p for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")), key=lambda p: p.name)
+            children = sorted(
+                (p for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")), key=lambda p: p.name
+            )
         except OSError:
             continue
         for child in children:

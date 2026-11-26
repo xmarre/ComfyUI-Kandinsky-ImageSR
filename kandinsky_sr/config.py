@@ -136,8 +136,10 @@ class TransformerConfig:
     @staticmethod
     def is_fp32_tensor(name: str) -> bool:
         """Tensors the reference keeps in FP32 (``_keep_in_fp32_modules``)."""
-        return name.endswith(("time_embed_table", "xattn_bias_table")) or ".modulation." in name or (
-            "visual_modulation." in name
+        return (
+            name.endswith(("time_embed_table", "xattn_bias_table"))
+            or ".modulation." in name
+            or ("visual_modulation." in name)
         )
 
 
@@ -231,9 +233,7 @@ def parse_transformer_config(cfg: dict[str, Any]) -> TransformerConfig:
             try:
                 config.timestep_index(t)
             except BundleError as error:
-                raise BundleError(
-                    f"bundle lacks the baked entry for x{factor} creativity {level} (t={t})"
-                ) from error
+                raise BundleError(f"bundle lacks the baked entry for x{factor} creativity {level} (t={t})") from error
     return config
 
 
@@ -248,8 +248,10 @@ def validate_vae_config(cfg: dict[str, Any]) -> float:
         isinstance(blocks, list) and len(blocks) == 4,
         "VAE must have four resolution levels (8x spatial compression)",
     )
-    _require(not cfg.get("use_quant_conv", False) and not cfg.get("use_post_quant_conv", False),
-             "VAE with quant convolutions is not the FLUX autoencoder")
+    _require(
+        not cfg.get("use_quant_conv", False) and not cfg.get("use_post_quant_conv", False),
+        "VAE with quant convolutions is not the FLUX autoencoder",
+    )
     scale = cfg.get("scaling_factor")
     _require(
         isinstance(scale, (int, float)) and not isinstance(scale, bool) and math.isfinite(scale) and scale > 0,

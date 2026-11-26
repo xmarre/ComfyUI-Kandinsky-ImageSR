@@ -275,7 +275,9 @@ class KandinskyImageSRTransformer(nn.Module):
             [BakedBlock(config, ops, fp32_factory, factory) for _ in range(config.num_visual_blocks)]
         )
         self.out_layer = OutLayer(config, ops, fp32_factory, factory)
-        self.register_buffer("time_embed_table", torch.empty(len(config.baked_timesteps), config.time_dim, **fp32_factory))
+        self.register_buffer(
+            "time_embed_table", torch.empty(len(config.baked_timesteps), config.time_dim, **fp32_factory)
+        )
 
     def forward(self, latents: torch.Tensor, timestep_index: int, rope: torch.Tensor | None = None) -> torch.Tensor:
         """``rope`` may be precomputed with :func:`build_rope` and reused across calls."""
