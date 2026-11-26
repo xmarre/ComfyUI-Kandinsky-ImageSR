@@ -47,11 +47,13 @@ def main() -> None:
     parser.add_argument("--accumulation", nargs="+", default=["auto"], choices=["auto", "cpu", "gpu"])
     parser.add_argument("--weight-dtype", default="bf16", choices=["default", "bf16", "fp32"])
     parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=3, help="measured repetitions (at least 1)")
     parser.add_argument("--stages", action="store_true", help="time encode/transformer/decode (adds syncs)")
     parser.add_argument("--json", help="write results as JSON")
     parser.add_argument("--comfy-args", nargs=argparse.REMAINDER, default=[])
     args = parser.parse_args()
+    if args.repeats < 1 or args.warmup < 0:
+        parser.error("--repeats must be at least 1 and --warmup non-negative")
 
     from _comfy_bootstrap import bootstrap
 
@@ -98,7 +100,7 @@ def main() -> None:
         for factor in args.factors:
             for batch in args.tile_batch_sizes:
                 for acc in args.accumulation:
-                    times = []
+                    repetitions = []
                     for k in range(args.warmup + args.repeats):
                         for v in stage_times.values():
                             v.clear()
@@ -106,29 +108,53 @@ def main() -> None:
                             torch.cuda.reset_peak_memory_stats(device)
                         _sync(device)
                         t = time.perf_counter()
-                        _, stats = runtime.upscale(
+                        output, stats = runtime.upscale(
                             model, image, factor, args.creativity, tile_batch_size=batch, accumulation_device=acc
                         )
                         _sync(device)
-                        if k >= args.warmup:
-                            times.append(time.perf_counter() - t)
+                        seconds = time.perf_counter() - t
+                        # Release the output before the next repetition so it cannot
+                        # reduce the memory available to (and the batch chosen by) it.
+                        del output
+                        if k < args.warmup:
+                            continue
+                        rep = {
+                            "seconds": seconds,
+                            "tiles": stats.tiles,
+                            "effective_batch": stats.final_batch_size,
+                            "batch_sizes": sorted(set(stats.batch_sizes)),
+                            "oom_retries": stats.oom_retries,
+                        }
+                        if device.type == "cuda":
+                            rep["peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / 1024**3
+                            rep["peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / 1024**3
+                        if args.stages:
+                            rep["stage_seconds"] = {name: sum(v) for name, v in stage_times.items()}
+                        repetitions.append(rep)
+                    times = [r["seconds"] for r in repetitions]
+                    median = statistics.median(times)
                     entry = {
                         "input": size,
                         "factor": factor,
-                        "tiles": stats.tiles,
+                        "tiles": repetitions[0]["tiles"],
                         "tile_batch_size": batch,
-                        "effective_batch": stats.final_batch_size,
                         "accumulation": acc,
-                        "median_seconds": statistics.median(times),
+                        "median_seconds": median,
                         "min_seconds": min(times),
-                        "tiles_per_second": stats.tiles / statistics.median(times),
-                        "oom_retries": stats.oom_retries,
+                        "tiles_per_second": repetitions[0]["tiles"] / median,
+                        # aggregated over all measured repetitions, not taken from the last one
+                        "effective_batches": sorted({r["effective_batch"] for r in repetitions}),
+                        "oom_retries_total": sum(r["oom_retries"] for r in repetitions),
+                        "repetitions": repetitions,
                     }
                     if device.type == "cuda":
-                        entry["peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / 1024**3
-                        entry["peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / 1024**3
+                        entry["max_peak_allocated_gib"] = max(r["peak_allocated_gib"] for r in repetitions)
+                        entry["max_peak_reserved_gib"] = max(r["peak_reserved_gib"] for r in repetitions)
                     if args.stages:
-                        entry["stage_seconds"] = {k: sum(v) for k, v in stage_times.items()}
+                        entry["median_stage_seconds"] = {
+                            name: statistics.median(r["stage_seconds"][name] for r in repetitions)
+                            for name in stage_times
+                        }
                     results["runs"].append(entry)
                     print(json.dumps(entry), flush=True)
     if args.json:

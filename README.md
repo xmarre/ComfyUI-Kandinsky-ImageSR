@@ -171,17 +171,22 @@ very large overlaps only multiply the work.
 - **Out of memory.** If a batch fails with an out-of-memory error, it is
   discarded and retried at half the size. Tiles are added to the output only
   after every stage of their batch succeeded, so no tile is accumulated twice or
-  lost. If a single tile does not fit, the node stops with an explicit error
+  lost, and blend buffers allocated by the failed attempt are released before
+  the retry. If a single tile does not fit, the node stops with an explicit error
   (the tile size is fixed by the model). Errors that are not out-of-memory are
   never retried.
 - **Accumulation.** The FP32 RGB blend buffer needs 12 bytes per output pixel
   (about 768 MiB for 8192x8192; the blend weights are separable and kept as two
-  1-D vectors). `auto` keeps it on the GPU only if two buffers fit in a quarter
-  of the free VRAM after the tile batch, otherwise in system RAM. Normalising
-  and copying to the output happens in row chunks without a second full-size
-  buffer.
+  1-D vectors). One buffer exists per image that the current tile batch
+  touches, and it is released as soon as the image is complete; a batch of `n`
+  tiles over images of `t` tiles each keeps at most `1 + ceil((n − 1) / t)`
+  buffers alive. `auto` keeps them on the GPU only if all of those fit in a
+  quarter of the free VRAM after the tile batch, otherwise in system RAM; `cpu`
+  always uses system RAM (also with `--gpu-only`). Normalising and copying to
+  the output happens in row chunks without a second full-size buffer.
 - **Batches of images** share one tile queue, so small images are batched
-  across image boundaries.
+  across image boundaries. With an explicit `tile_batch_size`, working memory
+  is reserved only for as many tiles as there are.
 - Progress is reported per tile and the node checks for cancellation between
   stages.
 

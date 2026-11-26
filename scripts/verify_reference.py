@@ -78,11 +78,16 @@ def runs_from_args(args) -> list[dict]:
 
 
 def _cpu_autocast(device: torch.device):
-    """On CPU, emulate the official CUDA path, which runs the transformer under bf16 autocast.
+    """On CPU, emulate the official CUDA transformer precision (bf16 autocast).
 
-    Without it the official pipeline on CPU computes the modulation projections in
-    FP32, which is not what it does on GPUs. CPU autocast applies the same casts to
-    the operations involved (linear layers, SDPA); the VAE weights are bf16 already.
+    The official pipeline enters autocast per stage and only on CUDA: the
+    transformer runs under bf16 autocast, VAE encoding runs without autocast and
+    VAE decoding under autocast. On CPU it uses no autocast at all, so its
+    transformer would compute the modulation projections in FP32. This context is
+    applied to the transformer call only. VAE stages are left exactly as the
+    official CPU path runs them; CPU autocast cannot reproduce CUDA's FP32 group
+    normalisation in the decoder, so decoder precision on CUDA is only qualified by
+    running this script on CUDA.
     """
     from contextlib import nullcontext
 
@@ -113,7 +118,8 @@ def phase_reference(args) -> None:
             return out
 
         def _forward(*a, stages=stages, forward=forward, **k):
-            out = forward(*a, **k)
+            with _cpu_autocast(device):
+                out = forward(*a, **k)
             pred = out[0] if isinstance(out, tuple) else getattr(out, "sample", out)
             stages["pred"].append(pred.squeeze(1).permute(0, 3, 1, 2).float().cpu())
             return out
@@ -121,10 +127,7 @@ def phase_reference(args) -> None:
         pipe._encode, pipe._decode, pipe.transformer.forward = _encode, _decode, _forward
         start = time.perf_counter()
         try:
-            with _cpu_autocast(device):
-                output = pipe(
-                    image[0], upscale_factor=run["factor"], creativity=run["creativity"], output_type="pt"
-                ).images
+            output = pipe(image[0], upscale_factor=run["factor"], creativity=run["creativity"], output_type="pt").images
         finally:
             pipe._encode, pipe._decode, pipe.transformer.forward = encode, decode, forward
         record["runs"].append({**run, **stages, "output": output.float().cpu(), "seconds": time.perf_counter() - start})
@@ -180,6 +183,7 @@ def phase_native(args) -> None:
 
     bootstrap(args.comfyui, args.comfy_args)
     from kandinsky_sr import runtime
+    from kandinsky_sr.pipeline import TiledRestorer
 
     reference = torch.load(args.reference, weights_only=False)
     torch.set_grad_enabled(False)
@@ -190,25 +194,42 @@ def phase_native(args) -> None:
     for ref_run in reference["runs"]:
         for batch in args.tile_batch_sizes:
             stages = {"lq": [], "pred": [], "decoded": []}
+            pending: dict[str, torch.Tensor] = {}
             encode, transform, decode = backend_cls.encode, backend_cls.transform, backend_cls.decode
+            infer, commit = TiledRestorer._infer, TiledRestorer._commit
 
-            def _encode(self, pixels, stages=stages, encode=encode):
+            # Stage outputs are held per attempt and recorded only when the pipeline
+            # commits the batch, so out-of-memory retries never duplicate tiles.
+            def _infer(self, *a, pending=pending, infer=infer):
+                pending.clear()
+                return infer(self, *a)
+
+            def _commit(self, units, prepared, accumulators, pending=pending, stages=stages, commit=commit):
+                commit(self, units, prepared, accumulators)
+                stages["lq"].append(pending.pop("lq"))
+                stages["pred"].append(pending.pop("pred"))
+                decoded = pending.pop("decoded")
+                kept = sum(t.shape[0] for t in stages["decoded"])
+                if kept < MAX_DECODED_TILES:
+                    stages["decoded"].append(decoded[: MAX_DECODED_TILES - kept])
+
+            def _encode(self, pixels, pending=pending, encode=encode):
                 out = encode(self, pixels)
-                stages["lq"].append(out.float().cpu())
+                pending["lq"] = out.float().cpu()
                 return out
 
-            def _transform(self, latents, index, stages=stages, transform=transform):
+            def _transform(self, latents, index, pending=pending, transform=transform):
                 out = transform(self, latents, index)
-                stages["pred"].append(out.float().cpu())
+                pending["pred"] = out.float().cpu()
                 return out
 
-            def _decode(self, latents, stages=stages, decode=decode):
+            def _decode(self, latents, pending=pending, decode=decode):
                 out = decode(self, latents)
-                if sum(t.shape[0] for t in stages["decoded"]) < MAX_DECODED_TILES:
-                    stages["decoded"].append(out.float().cpu())
+                pending["decoded"] = out.float().cpu()
                 return out
 
             backend_cls.encode, backend_cls.transform, backend_cls.decode = _encode, _transform, _decode
+            TiledRestorer._infer, TiledRestorer._commit = _infer, _commit
             start = time.perf_counter()
             try:
                 output, stats = runtime.upscale(
@@ -221,6 +242,14 @@ def phase_native(args) -> None:
                 )
             finally:
                 backend_cls.encode, backend_cls.transform, backend_cls.decode = encode, transform, decode
+                TiledRestorer._infer, TiledRestorer._commit = infer, commit
+            native_lq, native_pred = torch.cat(stages["lq"]), torch.cat(stages["pred"])
+            ref_lq, ref_pred = torch.cat(ref_run["lq"]), torch.cat(ref_run["pred"])
+            if native_lq.shape != ref_lq.shape or native_pred.shape != ref_pred.shape or stats.tiles != ref_lq.shape[0]:
+                raise SystemExit(
+                    f"tile mismatch: native {tuple(native_lq.shape)} ({stats.tiles} tiles) vs reference "
+                    f"{tuple(ref_lq.shape)}; the inputs or tile geometry differ"
+                )
             seconds = time.perf_counter() - start
             output = output.permute(0, 3, 1, 2).float().cpu()
             entry = {
@@ -229,8 +258,9 @@ def phase_native(args) -> None:
                 "tile_batch_size": batch,
                 "seconds_native": seconds,
                 "seconds_reference": ref_run["seconds"],
-                "lq": metrics(torch.cat(stages["lq"]), torch.cat(ref_run["lq"])),
-                "velocity": metrics(torch.cat(stages["pred"]), torch.cat(ref_run["pred"])),
+                "oom_retries": stats.oom_retries,
+                "lq": metrics(native_lq, ref_lq),
+                "velocity": metrics(native_pred, ref_pred),
                 "decoded_tiles": metrics(
                     torch.cat(stages["decoded"])[:MAX_DECODED_TILES],
                     torch.cat(ref_run["decoded"])[:MAX_DECODED_TILES],
