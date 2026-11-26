@@ -9,7 +9,8 @@ stage timing is only collected when ``--stages`` is given) and peak device memor
 
 Example::
 
-    python scripts/benchmark.py --comfyui /path/to/ComfyUI --bundle /models/Kandinsky-ImageSR-2.0 \
+    python scripts/benchmark.py --comfyui /path/to/ComfyUI \
+        --model /models/kandinsky_imagesr_2.0.safetensors --vae /models/vae/ae.safetensors \
         --sizes 1024 2048 --factors 2 4 --tile-batch-sizes 1 2 4 0 --accumulation auto cpu \
         --comfy-args --use-pytorch-cross-attention
 
@@ -39,7 +40,12 @@ def _sync(device: torch.device) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--comfyui", required=True)
-    parser.add_argument("--bundle", required=True)
+    parser.add_argument(
+        "--model", "--bundle", dest="model", required=True, help="single-file checkpoint or official bundle directory"
+    )
+    parser.add_argument("--vae", help="FLUX.1 ae.safetensors (required for a single-file checkpoint)")
+    parser.add_argument("--vae-dtype", default="default", choices=["default", "bf16", "fp32"])
+    parser.add_argument("--patcher", default="standard", choices=["standard", "dynamic"])
     parser.add_argument("--sizes", type=int, nargs="+", default=[1024], help="square input sizes")
     parser.add_argument("--factors", type=int, nargs="+", default=[2], choices=[2, 4])
     parser.add_argument("--creativity", type=int, default=4)
@@ -64,9 +70,18 @@ def main() -> None:
 
     device = mm.get_torch_device()
     start = time.perf_counter()
-    model = runtime.load_model(args.bundle, Path(args.bundle).name, weight_dtype=args.weight_dtype)
+    from _comfy_bootstrap import load_flux_vae
+
+    model = runtime.load_model(
+        args.model,
+        Path(args.model).name,
+        weight_dtype=args.weight_dtype,
+        vae_dtype=args.vae_dtype,
+        patcher=args.patcher,
+    )
     load_seconds = time.perf_counter() - start
-    mm.load_models_gpu([model.patcher, model.vae.patcher])
+    vae = load_flux_vae(args.vae, args.vae_dtype) or model.bundled_vae()
+    mm.load_models_gpu([model.patcher, vae.patcher])
     _sync(device)
     to_device_seconds = time.perf_counter() - start - load_seconds
     print(f"cold load: {load_seconds:.2f}s from disk, {to_device_seconds:.2f}s to {device}")
@@ -109,7 +124,13 @@ def main() -> None:
                         _sync(device)
                         t = time.perf_counter()
                         output, stats = runtime.upscale(
-                            model, image, factor, args.creativity, tile_batch_size=batch, accumulation_device=acc
+                            model,
+                            image,
+                            factor,
+                            args.creativity,
+                            tile_batch_size=batch,
+                            accumulation_device=acc,
+                            vae=vae,
                         )
                         _sync(device)
                         seconds = time.perf_counter() - t

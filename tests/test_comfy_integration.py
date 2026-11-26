@@ -49,6 +49,8 @@ def env(comfy, tmp_path_factory):
     state = comfy.diffusers_convert.convert_vae_state_dict(load_file(str(bundle / "vae" / VAE_WEIGHTS)))
     save_file({k: v.float().contiguous() for k, v in state.items()}, str(vae_file))
 
+    folder_paths.add_model_folder_path("vae", str(vae_file.parent))  # for the core Load VAE node
+
     def load_vae(dtype=None):
         return comfy.sd.VAE(sd=comfy.utils.load_torch_file(str(vae_file)), dtype=dtype)
 
@@ -350,7 +352,9 @@ def test_example_workflows_pass_comfyui_validation(env, io_dirs, path):
     assert result[0], (result[1], result[3])
 
 
-def test_basic_workflow_executes_through_prompt_executor(env, io_dirs):
+def _execute_workflow(path):
+    import inspect
+
     import execution
 
     class Server:
@@ -363,22 +367,35 @@ def test_basic_workflow_executes_through_prompt_executor(env, io_dirs):
         def queue_updated(self):
             pass
 
-    prompt = _api_prompt(json.loads((ROOT / "example_workflows" / "01_Basic_Upscale.json").read_text()))
+    prompt = _api_prompt(json.loads(path.read_text()))
     valid = asyncio.run(execution.validate_prompt("run", prompt, None))
     assert valid[0], valid[1]
-    import inspect
-
     kwargs = {}
     if "cache_args" in inspect.signature(execution.PromptExecutor.__init__).parameters:
         kwargs["cache_args"] = {"lru": 0, "ram": 0.0, "ram_inactive": 0.0}
     executor = execution.PromptExecutor(Server(), **kwargs)
     executor.execute(prompt, "run", {}, valid[2])
     assert executor.success, executor.status_messages[-3:]
-    saved = sorted((io_dirs / "output" / "kandinsky_sr").glob("upscale_*.png"))
-    assert saved
+
+
+def test_basic_workflow_executes_through_prompt_executor(env, io_dirs):
+    """Single-file checkpoint + core Load VAE, the primary workflow."""
     from PIL import Image
 
-    assert Image.open(saved[-1]).size == (60, 48)
+    _execute_workflow(ROOT / "example_workflows" / "01_Basic_Upscale.json")
+    saved = sorted((io_dirs / "output" / "kandinsky_sr").glob("upscale_*.png"))
+    assert saved and Image.open(saved[-1]).size == (60, 48)
+
+
+def test_workflows_saved_with_earlier_versions_still_run(env, io_dirs):
+    """A bundle workflow saved before the VAE input and the type rename existed."""
+    from PIL import Image
+
+    legacy = ROOT / "tests" / "fixtures" / "legacy_bundle_workflow.json"
+    assert "KANDINSKY_SR_MODEL" in legacy.read_text() and '"vae"' not in legacy.read_text()
+    _execute_workflow(legacy)
+    saved = sorted((io_dirs / "output" / "kandinsky_sr").glob("upscale_*.png"))
+    assert saved and Image.open(saved[-1]).size == (60, 48)
 
 
 @torch.no_grad()
@@ -481,3 +498,22 @@ def test_connected_vae_is_not_mutated_and_not_retained(env):
     gc.collect()
     assert ref() is None, "the connected VAE is kept alive by the ImageSR model"
     assert single._bundled_vae is None
+
+
+def test_dynamic_patcher_is_opt_in_and_guarded(env):
+    import importlib.util
+
+    import comfy.model_patcher
+
+    memory_management = None
+    if importlib.util.find_spec("comfy.memory_management") is not None:
+        import comfy.memory_management as memory_management
+    runtime = env["module"]("runtime")
+    path = env["models"] / "kandinsky_imagesr_2.0.safetensors"
+    model = runtime.load_model(path, "x", weight_dtype="bf16")
+    assert type(model.patcher) is comfy.model_patcher.ModelPatcher  # default, also with dynamic VRAM enabled
+    if not getattr(memory_management, "aimdo_enabled", False):
+        with pytest.raises(RuntimeError, match="dynamic VRAM is not available"):
+            runtime.load_model(path, "x", weight_dtype="bf16", patcher="dynamic")
+    with pytest.raises(ValueError, match="patcher"):
+        runtime.load_model(path, "x", weight_dtype="bf16", patcher="other")

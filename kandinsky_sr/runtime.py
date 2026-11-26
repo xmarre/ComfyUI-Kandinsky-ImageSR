@@ -174,8 +174,10 @@ def load_model(
         model_patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
     elif patcher == "dynamic":
         dynamic = getattr(comfy.model_patcher, "ModelPatcherDynamic", None)
-        import comfy.memory_management as memory_management
-
+        try:
+            import comfy.memory_management as memory_management
+        except ImportError:  # ComfyUI releases without dynamic VRAM
+            memory_management = None
         if dynamic is None or not getattr(memory_management, "aimdo_enabled", False):
             raise RuntimeError("dynamic VRAM is not available in this ComfyUI installation")
         model_patcher = dynamic(model, load_device=load_device, offload_device=offload_device)

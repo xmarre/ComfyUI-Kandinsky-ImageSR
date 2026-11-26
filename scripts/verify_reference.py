@@ -17,9 +17,12 @@ Example::
     # official environment
     python scripts/verify_reference.py reference --bundle /models/Kandinsky-ImageSR-2.0 \
         --image photo.png --out ref.pt
-    # ComfyUI environment
+    # ComfyUI environment: official bundle, or the single-file checkpoint + FLUX.1 VAE
     python scripts/verify_reference.py native --comfyui /path/to/ComfyUI \
         --bundle /models/Kandinsky-ImageSR-2.0 --reference ref.pt --report report.json
+    python scripts/verify_reference.py native --comfyui /path/to/ComfyUI \
+        --bundle /models/Kandinsky-ImageSR-2.0 --model /models/kandinsky_imagesr_2.0.safetensors \
+        --vae /models/vae/ae.safetensors --reference ref.pt --report report_single.json
 
 Without ``--image`` a deterministic synthetic test pattern is used.
 """
@@ -187,7 +190,17 @@ def phase_native(args) -> None:
 
     reference = torch.load(args.reference, weights_only=False)
     torch.set_grad_enabled(False)
-    model = runtime.load_model(args.bundle, Path(args.bundle).name, weight_dtype="bf16", vae_dtype="bf16")
+    model_path = args.model or args.bundle
+    model = runtime.load_model(
+        model_path, Path(model_path).name, weight_dtype="bf16", vae_dtype=args.vae_dtype, patcher=args.patcher
+    )
+    from _comfy_bootstrap import load_flux_vae
+
+    vae = load_flux_vae(args.vae, args.vae_dtype)
+    print(
+        f"native: {model.bundle.kind} checkpoint, VAE {'from ' + args.vae if vae else 'bundled'}, "
+        f"patcher {type(model.patcher).__name__}"
+    )
     image = reference["image"].permute(0, 2, 3, 1).contiguous()
     backend_cls = runtime._ComfyBackend
     report = {"reference_device": reference["device"], "runs": [], "presets": {}}
@@ -239,6 +252,7 @@ def phase_native(args) -> None:
                     ref_run["creativity"],
                     tile_batch_size=batch,
                     accumulation_device=args.accumulation_device,
+                    vae=vae,
                 )
             finally:
                 backend_cls.encode, backend_cls.transform, backend_cls.decode = encode, transform, decode
@@ -325,6 +339,20 @@ def main() -> None:
     nat = sub.choices["native"]
     nat.add_argument("--comfyui", required=True, help="ComfyUI checkout")
     nat.add_argument("--reference", required=True, help="file written by the reference phase")
+    nat.add_argument("--model", help="single-file checkpoint to test instead of --bundle (same weights)")
+    nat.add_argument("--vae", help="FLUX.1 ae.safetensors to use instead of the bundle's VAE")
+    nat.add_argument(
+        "--vae-dtype",
+        default="bf16",
+        choices=["default", "bf16", "fp32"],
+        help="VAE precision (bf16 matches the reference)",
+    )
+    nat.add_argument(
+        "--patcher",
+        default="standard",
+        choices=["standard", "dynamic"],
+        help="ComfyUI model patcher for the transformer (dynamic needs ComfyUI's dynamic VRAM)",
+    )
     nat.add_argument("--tile-batch-sizes", type=int, nargs="+", default=[1, 4])
     nat.add_argument("--accumulation-device", default="auto", choices=["auto", "cpu", "gpu"])
     nat.add_argument("--report", help="write a JSON report")

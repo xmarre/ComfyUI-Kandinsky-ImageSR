@@ -3,9 +3,9 @@
 Native ComfyUI nodes for **Kandinsky ImageSR 2.0**, a one-step generative 2x/4x
 super-resolution and image restoration model from Kandinsky Lab.
 
-- Loads the unmodified Hugging Face bundle
-  ([kandinskylab/Kandinsky-ImageSR-2.0](https://huggingface.co/kandinskylab/Kandinsky-ImageSR-2.0)),
-  no conversion step.
+- Loads the single-file checkpoint `kandinsky_imagesr_2.0.safetensors` together
+  with the standard FLUX.1 VAE from ComfyUI's Load VAE node, or the unmodified
+  official Hugging Face bundle.
 - Native ComfyUI implementation of the baked transformer: ComfyUI operations,
   optimized attention dispatch, `ModelPatcher` model management (loading,
   offloading, low-VRAM partial loading). Diffusers/Transformers are not required.
@@ -49,10 +49,49 @@ against v0.3.50, v0.46.3 and the current ComfyUI master.
 
 ## Model download and placement
 
-Download the complete repository (about 10.4 GB) from
+### Recommended: single-file checkpoint + FLUX.1 VAE
+
+| File | Folder | Source |
+|---|---|---|
+| `kandinsky_imagesr_2.0.safetensors` (10.25 GB) | `ComfyUI/models/diffusion_models/` | [hmdlsk/Kandinsky-ImageSR-2.0-ComfyUI](https://huggingface.co/hmdlsk/Kandinsky-ImageSR-2.0-ComfyUI) |
+| `ae.safetensors` (FLUX.1 VAE, 335 MB) | `ComfyUI/models/vae/` | the FLUX.1 release; most FLUX installations already have it |
+
+The single-file checkpoint contains the transformer tensors of the official
+release unchanged (same names, shapes, dtypes and bytes) plus the official
+configuration files as safetensors metadata (`format =
+kandinsky_image_sr_single_file`, `format_version = 1`). It does not contain a
+VAE: connect `ae.safetensors` through a **Load VAE** node to the upscale node's
+`vae` input. Subfolders and `diffusion_models`/`vae` paths from
+`extra_model_paths.yaml` work as usual. Only files carrying this format's
+metadata are listed by the loader; to decide that, it reads just the
+safetensors header of each candidate.
+
+The official release ships its VAE as `ae.safetensors` rounded to bfloat16.
+With the VAE in bf16 (ComfyUI's default on GPUs that support it) the two are
+bit-for-bit the same weights. Loading `ae.safetensors` in fp32 (`--fp32-vae`)
+runs the VAE at higher precision than the official pipeline, which is not
+bit-identical to it; its effect on results has not been evaluated.
+
+To create the single-file checkpoint from an official bundle you already have
+(streams the data; uses little memory):
+
+```bash
+python scripts/convert_to_single_file.py convert <bundle folder> \
+  ComfyUI/models/diffusion_models/kandinsky_imagesr_2.0.safetensors --verify
+```
+
+Converting the unmodified official bundle reproduces the published
+`kandinsky_imagesr_2.0.safetensors` byte for byte (SHA-256
+`56e2a496735be188faf8750a21e5221281e0ddf639ae15bf9947d6942c84fc3c`).
+`scripts/convert_to_single_file.py compare <checkpoint> <bundle folder>` checks
+any single-file checkpoint against a bundle (metadata and every tensor's bytes).
+
+### Alternative: official Hugging Face bundle
+
+Download the repository (about 10.4 GB) from
 <https://huggingface.co/kandinskylab/Kandinsky-ImageSR-2.0> and place it, with
 its folder structure unchanged, in a folder inside `models/diffusion_models`
-(or any `diffusion_models` path configured in `extra_model_paths.yaml`):
+(or any configured `diffusion_models` path):
 
 ```text
 ComfyUI/models/diffusion_models/Kandinsky-ImageSR-2.0/
@@ -68,24 +107,26 @@ ComfyUI/models/diffusion_models/Kandinsky-ImageSR-2.0/
     └── diffusion_pytorch_model.safetensors
 ```
 
-The `assets/` folder, `README.md`, `SOURCE.json` and `.gitattributes` are not
-needed. One way to download exactly the required files:
-
 ```bash
 huggingface-cli download kandinskylab/Kandinsky-ImageSR-2.0 \
   --include "model_index.json" "transformer/*" "vae/*" \
   --local-dir ComfyUI/models/diffusion_models/Kandinsky-ImageSR-2.0
 ```
 
-The loader lists bundle folders found directly in a `diffusion_models` root or
-one level below it (for example `diffusion_models/kandinsky/Kandinsky-ImageSR-2.0`).
-Nothing is downloaded automatically.
+Bundle folders are found directly in a `diffusion_models` root or one level
+below it. When no VAE is connected, the bundle's own VAE is used.
 
-Before any weights are read, the loader checks every configuration value it
-depends on and every tensor name, shape and storage dtype of the transformer
-shards and the VAE against the architecture, and rejects missing, duplicated,
-unexpected, truncated or mis-shaped tensors with a specific error message. There
-is no partial or approximate loading.
+### Validation
+
+Nothing is downloaded automatically. Before any weights are read, the loader
+checks every configuration value it depends on and every tensor name, shape and
+storage dtype against the architecture, and rejects missing, duplicated,
+unexpected, overlapping, truncated or mis-shaped tensors and unknown format
+versions with a specific error message. A connected VAE must have the FLUX.1
+architecture, 8x compression, 16 latent channels and the FLUX.1 encoder weights
+(architecturally identical VAEs with a different latent space, such as the SD3
+VAE, are rejected); it must run in bf16 or fp32. The connected VAE is only read,
+never modified, so other branches of the workflow that use it are unaffected.
 
 ## Nodes
 
@@ -93,13 +134,17 @@ is no partial or approximate loading.
 
 | Input | Default | Description |
 |---|---|---|
-| `model_name` | – | Bundle folder (see above). |
+| `model_name` | – | Single-file checkpoint or bundle folder (see above). |
 | `weight_dtype` | `default` | Transformer precision: `default` (bf16 where supported, otherwise fp32), `bf16`, `fp32`. |
-| `vae_dtype` | `default` | VAE precision: `default` (ComfyUI's VAE precision choice), `bf16`, `fp32`. |
+| `vae_dtype` | `default` | Precision of a bundle's own VAE (used only when no VAE is connected): `default` (ComfyUI's choice), `bf16`, `fp32`. |
 
-Output: `KANDINSKY_SR_MODEL`, holding the transformer and VAE as two separately
-managed ComfyUI models. Changing upscale settings or inputs reuses the loaded
-model; it is reloaded only when the loader's own inputs change.
+Output: `sr_model` (connection type `KANDINSKY_IMAGESR_MODEL`), the transformer
+under ComfyUI model management. Changing upscale settings or inputs reuses the
+loaded model; it is reloaded only when the loader's own inputs change. The
+connection type is specific to this package so it cannot be wired into
+another Kandinsky ImageSR node pack; the upscale input also accepts the earlier
+name `KANDINSKY_SR_MODEL` so saved workflows keep working, and it reports a
+clear error if it receives another pack's model object.
 
 ### Kandinsky ImageSR Upscale (`KandinskyImageSRUpscale`)
 
@@ -112,6 +157,7 @@ model; it is reloaded only when the loader's own inputs change.
 | `overlap` | 0.25 | 0.05–0.75 | Fraction of each input tile shared with its neighbour. 0.25 is the official default. |
 | `tile_batch_size` | 0 | 0–64 | Tiles processed together; 0 = automatic. |
 | `accumulation_device` | `auto` | `auto`, `cpu`, `gpu` | Where the FP32 blend buffer lives. |
+| `vae` (optional) | – | | FLUX.1 VAE from Load VAE. Required for the single-file checkpoint; replaces a bundle's own VAE. |
 
 Output: `IMAGE`.
 
@@ -157,9 +203,8 @@ very large overlaps only multiply the work.
 
 ## Memory and performance behaviour
 
-- **Model residency.** The transformer (10.25 GB of weights in bf16 mode, with
-  the modulation layers and conditioning tables kept in FP32 as in the reference;
-  about 18.1 GB in fp32 mode) and the VAE (0.17 GB in bf16) are loaded through
+- **Model residency.** The transformer (9.06 GB of weights in bf16 mode, about
+  18.1 GB in fp32 mode) and the VAE (0.17 GB in bf16) are loaded through
   ComfyUI's model manager together with an estimate of the working memory
   needed. With `--lowvram`/normal VRAM mode ComfyUI may keep part of the
   transformer in system RAM and stream it (slower); `--highvram` keeps it
@@ -201,11 +246,22 @@ hardware.
 
 | Mode | Transformer | Notes |
 |---|---|---|
-| `bf16` | bf16 weights and activations; modulation weights, baked tables, normalisation, modulation arithmetic, residual updates and the flow correction in FP32 | Reproduces the official CUDA inference (which runs under bf16 autocast). |
+| `bf16` | bf16 weights and activations; baked tables, normalisation, modulation arithmetic, residual updates and the flow correction in FP32 | Reproduces the official CUDA inference (which runs under bf16 autocast). |
 | `fp32` | everything FP32 | Higher precision than the reference; about 18.1 GB of weights. For GPUs without bf16 support. |
 
+The checkpoint stores the modulation projections in FP32, but the official
+CUDA inference computes them under bf16 autocast, which rounds weight and bias
+to bf16 on every call. In bf16 mode these weights are therefore stored as that
+same bf16 rounding (1.19 GB less memory, bit-identical results; covered by a
+test against the reference computation). fp32 mode keeps them in FP32. The baked
+time-embedding and cross-attention tables always stay FP32.
+
 FP16 and FP8/INT8 weight formats are not offered: they have not been qualified
-for this model. ComfyUI's global `--fp16-unet`/`--fp8-*-unet` flags are ignored
+for this model. Storing the attention and feed-forward weights as FP8 (e4m3fn)
+and upcasting them for compute changes the transformer output by about 9–10 %
+relative RMS on a real tile (42 % of these weights fall below e4m3fn's smallest
+normal value), and saves memory without speeding up inference; accelerated FP8
+or INT8 execution would need dedicated kernels and a quality evaluation. ComfyUI's global `--fp16-unet`/`--fp8-*-unet` flags are ignored
 for this model with a warning.
 
 The VAE follows the reference latent convention: latents are multiplied by the
@@ -224,6 +280,10 @@ In `example_workflows/` (drag into ComfyUI):
   memory-aware accumulation.
 - `04_Qualification_Grid.json` – 2x and 4x at creativity 0/4/8 plus bicubic
   baselines, for judging results on your own images.
+- `05_Official_Bundle.json` – the official bundle with its own VAE.
+
+Workflows 01–04 use the single-file checkpoint with `ae.safetensors` from Load
+VAE.
 
 ## Testing and reference qualification
 
@@ -288,12 +348,18 @@ configured and are not qualified.
 
 ## Troubleshooting
 
-- **The loader shows "(no Kandinsky ImageSR bundle found)"**: the bundle folder
-  must contain `model_index.json` and `transformer/config.json` and be located
-  directly inside a `diffusion_models` folder or one level below it. Refresh the
-  browser after adding it.
-- **"weights do not match the expected architecture" / "truncated"**: a shard is
+- **The loader shows "(no Kandinsky ImageSR checkpoint found)"**: put
+  `kandinsky_imagesr_2.0.safetensors` in a `diffusion_models` folder (subfolders
+  are fine), or a bundle folder containing `model_index.json` and
+  `transformer/config.json` directly inside a `diffusion_models` folder or one
+  level below it. Refresh the browser after adding it. A `.safetensors` file
+  without the single-file format metadata is not listed.
+- **"weights do not match the expected architecture" / "truncated"**: a file is
   incomplete or from a different model; re-download the listed file.
+- **"no bundled VAE: connect the FLUX.1 VAE"**: the single-file checkpoint needs a
+  Load VAE node with `ae.safetensors` connected to the upscale node.
+- **"incompatible VAE"**: the connected VAE is not the FLUX.1 VAE (for example an
+  SD1/SDXL, SD3 or FLUX.2 VAE). Select `ae.safetensors` in Load VAE.
 - **Out of memory with a single tile**: free VRAM, use `--lowvram`, or set
   `accumulation_device` to `cpu`.
 - **Colours differ from the official command line tool**: ComfyUI's Load Image
@@ -306,11 +372,17 @@ configured and are not qualified.
 - Only the published 2x/4x tile geometry and the 18 calibrated timesteps are
   supported; arbitrary strengths would require timesteps that are not baked into
   the checkpoint.
-- Quantized (FP8/INT8) and FP16 execution, converted single-file checkpoints,
-  `torch.compile` and dynamic-VRAM (`ModelPatcherDynamic`) integration are not
+- Quantized (FP8/INT8) and FP16 execution and `torch.compile` are not
   implemented.
-- The transformer is managed by ComfyUI's standard `ModelPatcher`; LoRA or other
-  weight patches for this model are not supported.
+- The transformer is managed by ComfyUI's standard `ModelPatcher`, also when
+  ComfyUI's dynamic VRAM is enabled (dynamic VRAM still applies to other models,
+  including the VAE). The transformer is built from ComfyUI's casting operations
+  and should be compatible with `ModelPatcherDynamic`, but that path has not been
+  tested on a GPU; the qualification and benchmark scripts can select it with
+  `--patcher dynamic`. LoRA or other weight patches for this model are not
+  supported.
+- Combined single-file checkpoints with a bundled VAE (`transformer.`/`vae.`
+  tensor prefixes) are not supported; use the transformer-only file.
 - Visual quality has only been spot-checked on a few public-domain photographs;
   GPU performance has not been measured by this project. Use
   `04_Qualification_Grid.json` and `scripts/benchmark.py` on your own data and
@@ -323,5 +395,8 @@ configured and are not qualified.
   [kandinsky-image-sr](https://github.com/kandinskylab/kandinsky-image-sr)
   (MIT). The Kandinsky 5 building blocks are ported from Diffusers
   (Apache-2.0). Notices are reproduced in `NOTICE`.
+- The single-file checkpoint format and its tensor layout follow
+  [ComfyUI-KSR-Unofficial](https://github.com/the-aSak/ComfyUI-KSR-Unofficial)
+  (MIT); `scripts/convert_to_single_file.py` reproduces its converter's output.
 - Model weights (not distributed here): Kandinsky ImageSR 2.0, MIT License. The
-  bundled VAE is the FLUX.1-schnell VAE by Black Forest Labs, Apache-2.0.
+  VAE is the FLUX.1-schnell VAE by Black Forest Labs, Apache-2.0.

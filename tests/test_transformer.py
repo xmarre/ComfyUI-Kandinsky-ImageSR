@@ -150,3 +150,19 @@ def test_fp32_mode_is_close_to_bf16_reference():
     actual = native(lq, cfg.timestep_index(0.15))
     rel = (actual - expected).norm() / expected.norm()
     assert rel < 0.05
+
+
+@torch.no_grad()
+def test_bf16_storage_of_modulation_weights_is_exact_in_bf16_mode():
+    """Autocast rounds the FP32 modulation weights to BF16 on every call; storing that rounding once is identical."""
+    cfg, ref, native = _pair()
+    lq = _latents(cfg)
+    expected = native(lq, cfg.timestep_index(0.244))
+    for name, param in native.named_parameters():
+        if "modulation" in name:
+            param.data = param.data.to(torch.bfloat16)
+    assert native.visual_transformer_blocks[0].visual_modulation.out_layer.weight.dtype == torch.bfloat16
+    assert native.visual_transformer_blocks[0].xattn_bias_table.dtype == torch.float32
+    assert torch.equal(native(lq, cfg.timestep_index(0.244)), expected)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert torch.equal(reference_velocity(ref, lq, 0.244), expected)
