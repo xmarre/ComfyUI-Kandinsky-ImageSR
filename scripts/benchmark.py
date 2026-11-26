@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Benchmark the native pipeline inside a ComfyUI environment (no server).
 
-Measures cold load time, warm end-to-end latency, tile throughput, per-stage time
-(VAE encode, transformer, VAE decode; measured with device synchronisation, so
+Measures model load time (from disk into this process; the operating system's file
+cache may already hold the weights, so drop it beforehand for a true cold start),
+warm end-to-end latency, tile throughput, per-stage time (VAE encode, transformer,
+VAE decode; measured with device synchronisation, so
 stage timing is only collected when ``--stages`` is given) and peak device memory.
 
 Example::
