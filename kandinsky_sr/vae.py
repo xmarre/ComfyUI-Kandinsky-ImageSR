@@ -15,6 +15,7 @@ decoding runs under CUDA autocast when the VAE dtype is FP16/BF16 (the official
 
 from __future__ import annotations
 
+import functools
 from contextlib import nullcontext
 from typing import Any
 
@@ -94,6 +95,7 @@ def load_reference_fingerprint() -> dict:
     return json.loads((Path(__file__).with_name(_FINGERPRINT_FILE)).read_text())
 
 
+@functools.lru_cache(maxsize=1)
 def _expected_ldm_shapes() -> dict[str, tuple[int, ...]]:
     """FLUX VAE parameter shapes under ComfyUI's (LDM) names."""
     import comfy.diffusers_convert
@@ -142,7 +144,7 @@ def validate_imagesr_vae(vae: object) -> None:
     if getattr(vae, "downscale_ratio", None) != 8 or getattr(vae, "upscale_ratio", None) != 8:
         problems.append("spatial compression is not 8x")
     if not problems:
-        expected = _expected_ldm_shapes()
+        expected = dict(_expected_ldm_shapes())
         actual = {k: tuple(v.shape) for k, v in model.state_dict(keep_vars=True).items()}
         if actual != expected:
             missing = sorted(set(expected) - set(actual))[:3]
