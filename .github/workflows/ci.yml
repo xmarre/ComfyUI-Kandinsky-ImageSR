@@ -42,7 +42,12 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: pip install safetensors numpy pillow pytest
-      - run: python -m pytest -q
+      - name: Test
+        # Some hosted Windows VMs advertise AVX-512/AMX through CPUID but fault on
+        # them (0xc000001d in oneDNN's bf16 kernels); cap oneDNN at AVX2 there.
+        env:
+          ONEDNN_MAX_CPU_ISA: ${{ runner.os == 'Windows' && 'AVX2' || 'ALL' }}
+        run: python -m pytest -q
 
   comfyui:
     # Full suite against a real ComfyUI checkout in CPU mode.
