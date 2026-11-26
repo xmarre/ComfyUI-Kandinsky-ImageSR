@@ -170,69 +170,75 @@ class TiledRestorer:
         position = 0
         acc_device = opts.accumulation_device
 
-        while position < len(queue):
-            self._check_interrupt(opts)
-            units = queue[position : position + batch_size]
-            decoded = windows = None
-            out_of_memory = False
-            try:
-                decoded = self._infer(images, units, opts)
-                # Everything that allocates happens before the commit loop: moving the
-                # result to the accumulation device, windows and new accumulators.
-                decoded = decoded.to(acc_device)
-                windows = [self._window(r, c, acc_device) for _, r, c in units]
-                for image_index, _, _ in units:
-                    if image_index not in accumulators:
-                        accumulators[image_index] = _Accumulator(g, acc_device)
-            except Exception as error:
-                if not is_oom(error):
-                    raise
-                out_of_memory = True
-            if out_of_memory:
-                # Handled outside the except block so the traceback (which references the
-                # failed batch's tensors) is already released.
+        try:
+            while position < len(queue):
+                self._check_interrupt(opts)
+                units = queue[position : position + batch_size]
                 decoded = windows = None
-                stats.oom_retries += 1
-                if opts.on_oom is not None:
-                    opts.on_oom(batch_size)
-                if batch_size == 1:
-                    raise TileBatchOOMError(
-                        "Kandinsky ImageSR ran out of memory while processing a single "
-                        f"{g.tile_size}x{g.tile_size} tile. The tile size is fixed by the model and cannot be "
-                        "reduced. Free GPU memory (close other applications or unload other models), start "
-                        "ComfyUI with --lowvram so model weights can be partially offloaded, or set "
-                        "accumulation_device to 'cpu'."
-                    )
-                batch_size = max(1, batch_size // 2)
-                logger.warning("Kandinsky ImageSR: out of memory, retrying with tile_batch_size=%d", batch_size)
-                continue
+                out_of_memory = False
+                try:
+                    decoded = self._infer(images, units, opts)
+                    # Everything that allocates happens before the commit loop: moving the
+                    # result to the accumulation device, windows and new accumulators.
+                    decoded = decoded.to(acc_device)
+                    windows = [self._window(r, c, acc_device) for _, r, c in units]
+                    for image_index, _, _ in units:
+                        if image_index not in accumulators:
+                            accumulators[image_index] = _Accumulator(g, acc_device)
+                except Exception as error:
+                    if not is_oom(error):
+                        raise
+                    out_of_memory = True
+                if out_of_memory:
+                    # Handled outside the except block so the traceback (which references the
+                    # failed batch's tensors) is already released.
+                    decoded = windows = None
+                    stats.oom_retries += 1
+                    if opts.on_oom is not None:
+                        opts.on_oom(batch_size)
+                    if batch_size == 1:
+                        raise TileBatchOOMError(
+                            "Kandinsky ImageSR ran out of memory while processing a single "
+                            f"{g.tile_size}x{g.tile_size} tile. The tile size is fixed by the model and cannot be "
+                            "reduced. Free GPU memory (close other applications or unload other models), start "
+                            "ComfyUI with --lowvram so model weights can be partially offloaded, or set "
+                            "accumulation_device to 'cpu'."
+                        )
+                    batch_size = max(1, batch_size // 2)
+                    logger.warning("Kandinsky ImageSR: out of memory, retrying with tile_batch_size=%d", batch_size)
+                    continue
 
-            # Commit: in-place accumulation only, no allocations, cannot fail midway.
-            for index, (image_index, row, col) in enumerate(units):
-                acc = accumulators[image_index]
-                top = g.tops[row] * g.factor
-                left = g.lefts[col] * g.factor
-                region = acc.buffer[:, top : top + g.tile_size, left : left + g.tile_size]
-                region.addcmul_(decoded[index], windows[index])
-                acc.committed += 1
-            del decoded, windows
-            position += len(units)
-            stats.batches += 1
-            stats.tiles += len(units)
-            stats.batch_sizes.append(len(units))
-            stats.final_batch_size = batch_size
-            if opts.progress is not None:
-                opts.progress(len(units))
+                # Commit: in-place accumulation only, no allocations, cannot fail midway.
+                for index, (image_index, row, col) in enumerate(units):
+                    acc = accumulators[image_index]
+                    top = g.tops[row] * g.factor
+                    left = g.lefts[col] * g.factor
+                    region = acc.buffer[:, top : top + g.tile_size, left : left + g.tile_size]
+                    region.addcmul_(decoded[index], windows[index])
+                    acc.committed += 1
+                del decoded, windows
+                position += len(units)
+                stats.batches += 1
+                stats.tiles += len(units)
+                stats.batch_sizes.append(len(units))
+                stats.final_batch_size = batch_size
+                if opts.progress is not None:
+                    opts.progress(len(units))
 
-            for image_index in sorted(accumulators):
-                acc = accumulators[image_index]
-                if acc.committed == g.num_tiles:
-                    self._finalize(acc, wy, wx, output[image_index])
-                    del accumulators[image_index]
+                for image_index in sorted(accumulators):
+                    acc = accumulators[image_index]
+                    if acc.committed == g.num_tiles:
+                        self._finalize(acc, wy, wx, output[image_index])
+                        del accumulators[image_index]
 
-        if accumulators:
-            raise RuntimeError("internal error: unfinished tile accumulators")
-        self._windows.clear()
+            if accumulators:
+                raise RuntimeError("internal error: unfinished tile accumulators")
+        finally:
+            # Drop device buffers now, even when an exception (whose traceback keeps
+            # this frame alive) propagates to the caller.
+            decoded = windows = None
+            accumulators.clear()
+            self._windows.clear()
         return output, stats
 
     def _finalize(self, acc: _Accumulator, wy: torch.Tensor, wx: torch.Tensor, out: torch.Tensor) -> None:

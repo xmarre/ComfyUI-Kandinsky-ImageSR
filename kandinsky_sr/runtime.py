@@ -266,11 +266,12 @@ def upscale(
         progress=pbar.update,
         on_oom=lambda _size: mm.soft_empty_cache(),
     )
-    with torch.no_grad():
-        rope = build_rope(model.config, device)
-        restorer = TiledRestorer(_ComfyBackend(model, rope), grid)
-        output, stats = restorer.run(rgb, options)
-        del rope, restorer
+    rope = build_rope(model.config, device)
+    try:
+        with torch.no_grad():
+            output, stats = TiledRestorer(_ComfyBackend(model, rope), grid).run(rgb, options)
+    finally:
+        del rope
 
     if alpha is not None:
         # Alpha is not part of the generative model: resize it bilinearly to the
