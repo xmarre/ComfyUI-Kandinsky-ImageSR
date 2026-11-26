@@ -59,24 +59,56 @@ class TileMemoryEstimate:
         return max(self.vae_encode, self.vae_decode, self.transformer) + self.io
 
 
+def max_active_accumulators(batch_size: int, tiles_per_image: int, images: int) -> int:
+    """Largest number of image accumulators alive at once for a given tile batch.
+
+    Tiles are queued image by image and an image's accumulator is released right
+    after the batch that completes it. During a batch, the live accumulators are
+    those of the images the batch touches: a window of ``batch_size`` consecutive
+    queue entries spans at most ``1 + ceil((batch_size - 1) / tiles_per_image)``
+    images.
+    """
+    if batch_size < 1 or tiles_per_image < 1 or images < 1:
+        raise ValueError("batch_size, tiles_per_image and images must be positive")
+    return min(images, 1 + -(-(batch_size - 1) // tiles_per_image))
+
+
 def auto_tile_batch(
-    free_bytes: int, reserved_bytes: int, per_tile: int, num_tiles: int, cap: int = AUTO_BATCH_CAP
+    free_bytes: int,
+    reserved_bytes: int,
+    per_tile: int,
+    num_tiles: int,
+    cap: int = AUTO_BATCH_CAP,
+    extra_bytes=None,
 ) -> int:
+    """Largest batch (at most ``cap``) whose working memory fits in the free memory.
+
+    ``extra_bytes(batch)`` adds batch-dependent memory, such as device-resident
+    accumulators. Never returns less than 1.
+    """
     usable = free_bytes - reserved_bytes
-    by_memory = int(usable // per_tile) if per_tile > 0 else cap
-    return max(1, min(cap, by_memory, num_tiles))
+    for batch in range(min(cap, num_tiles), 1, -1):
+        needed = batch * per_tile + (extra_bytes(batch) if extra_bytes is not None else 0)
+        if needed <= usable:
+            return batch
+    return 1
 
 
 def choose_accumulation_device(
     mode: str,
     compute_device: torch.device,
-    intermediate_device: torch.device,
     accumulator_bytes: int,
     free_bytes_after_batch: int,
 ) -> torch.device:
-    """Resolve ``auto``/``cpu``/``gpu`` to a concrete accumulation device."""
+    """Resolve ``auto``/``cpu``/``gpu`` to a concrete accumulation device.
+
+    ``accumulator_bytes`` is the total for all accumulators that can be alive at
+    once. ``cpu`` always means system memory, independent of where ComfyUI keeps
+    intermediate results (``--gpu-only`` keeps them on the GPU).
+    """
+    cpu = torch.device("cpu")
     if mode == "cpu":
-        return intermediate_device
+        return cpu
     if mode == "gpu":
         if compute_device.type == "cpu":
             raise ValueError("accumulation_device='gpu' requires a GPU compute device")
@@ -84,12 +116,10 @@ def choose_accumulation_device(
     if mode != "auto":
         raise ValueError(f"accumulation_device must be 'auto', 'cpu' or 'gpu', got {mode!r}")
     if compute_device.type == "cpu":
+        return cpu
+    if accumulator_bytes <= GPU_ACCUMULATOR_FREE_FRACTION * max(0, free_bytes_after_batch):
         return compute_device
-    # Up to two images can be active at once (the batch tail of one image and the
-    # head of the next), so budget two accumulators.
-    if 2 * accumulator_bytes <= GPU_ACCUMULATOR_FREE_FRACTION * max(0, free_bytes_after_batch):
-        return compute_device
-    return intermediate_device
+    return cpu
 
 
 def is_oom(error: BaseException) -> bool:

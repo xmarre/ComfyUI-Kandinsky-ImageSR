@@ -181,25 +181,8 @@ class TiledRestorer:
             while position < len(queue):
                 self._check_interrupt(opts)
                 units = queue[position : position + batch_size]
-                decoded = windows = None
-                out_of_memory = False
-                try:
-                    decoded = self._infer(images, units, opts)
-                    # Everything that allocates happens before the commit loop: moving the
-                    # result to the accumulation device, windows and new accumulators.
-                    decoded = decoded.to(acc_device)
-                    windows = [self._window(r, c, acc_device) for _, r, c in units]
-                    for image_index, _, _ in units:
-                        if image_index not in accumulators:
-                            accumulators[image_index] = _Accumulator(g, acc_device)
-                except Exception as error:
-                    if not is_oom(error):
-                        raise
-                    out_of_memory = True
-                if out_of_memory:
-                    # Handled outside the except block so the traceback (which references the
-                    # failed batch's tensors) is already released.
-                    decoded = windows = None
+                prepared = self._prepare(images, units, opts, accumulators, acc_device)
+                if prepared is None:
                     stats.oom_retries += 1
                     if opts.on_oom is not None:
                         opts.on_oom(batch_size)
@@ -215,15 +198,8 @@ class TiledRestorer:
                     logger.warning("Kandinsky ImageSR: out of memory, retrying with tile_batch_size=%d", batch_size)
                     continue
 
-                # Commit: in-place accumulation only, no allocations, cannot fail midway.
-                for index, (image_index, row, col) in enumerate(units):
-                    acc = accumulators[image_index]
-                    top = g.tops[row] * g.factor
-                    left = g.lefts[col] * g.factor
-                    region = acc.buffer[:, top : top + g.tile_size, left : left + g.tile_size]
-                    region.addcmul_(decoded[index], windows[index])
-                    acc.committed += 1
-                del decoded, windows
+                self._commit(units, prepared, accumulators)
+                del prepared
                 position += len(units)
                 stats.batches += 1
                 stats.tiles += len(units)
@@ -231,39 +207,88 @@ class TiledRestorer:
                 stats.final_batch_size = batch_size
                 if opts.progress is not None:
                     opts.progress(len(units))
-
-                for image_index in sorted(accumulators):
-                    acc = accumulators[image_index]
-                    if acc.committed == g.num_tiles:
-                        self._finalize(acc, wy, wx, output[image_index])
-                        del accumulators[image_index]
+                for image_index in sorted(i for i, acc in accumulators.items() if acc.committed == g.num_tiles):
+                    # pop first so the buffer is released as soon as finalisation returns
+                    self._finalize(accumulators.pop(image_index), wy, wx, output[image_index])
 
             if accumulators:
                 raise RuntimeError("internal error: unfinished tile accumulators")
+        except BaseException:
+            # The traceback keeps this frame alive; drop the output batch with it.
+            output = None
+            raise
         finally:
-            # Drop device buffers now, even when an exception (whose traceback keeps
-            # this frame alive) propagates to the caller.
-            decoded = windows = None
+            # Drop device buffers now, even when an exception propagates to the caller.
             accumulators.clear()
             self._windows.clear()
         return output, stats
+
+    def _prepare(
+        self,
+        images: torch.Tensor,
+        units: list[tuple[int, int, int]],
+        opts: RunOptions,
+        accumulators: dict[int, _Accumulator],
+        acc_device: torch.device,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+        """Run every allocating step of a batch; ``None`` on out-of-memory.
+
+        On failure, accumulators created by this attempt are removed again so the
+        retry starts from the same memory state as the failed attempt did.
+        Accumulators of earlier batches (which hold committed tiles) are kept.
+        """
+        created: list[int] = []
+        try:
+            decoded = self._infer(images, units, opts)
+            decoded = decoded.to(acc_device)
+            windows = [self._window(r, c, acc_device) for _, r, c in units]
+            for image_index, _, _ in units:
+                if image_index not in accumulators:
+                    accumulators[image_index] = _Accumulator(self.grid, acc_device)
+                    created.append(image_index)
+            return decoded, windows
+        except Exception as error:
+            if not is_oom(error):
+                raise
+        # Out of memory: outside the except block, so the failed attempt's frames
+        # (and the tensors they reference) are already released.
+        for image_index in created:
+            del accumulators[image_index]
+        return None
+
+    def _commit(
+        self,
+        units: list[tuple[int, int, int]],
+        prepared: tuple[torch.Tensor, list[torch.Tensor]],
+        accumulators: dict[int, _Accumulator],
+    ) -> None:
+        """In-place accumulation only: no allocations, cannot fail midway."""
+        g = self.grid
+        decoded, windows = prepared
+        for index, (image_index, row, col) in enumerate(units):
+            acc = accumulators[image_index]
+            top = g.tops[row] * g.factor
+            left = g.lefts[col] * g.factor
+            acc.buffer[:, top : top + g.tile_size, left : left + g.tile_size].addcmul_(decoded[index], windows[index])
+            acc.committed += 1
 
     def _finalize(self, acc: _Accumulator, wy: torch.Tensor, wx: torch.Tensor, out: torch.Tensor) -> None:
         """Normalise by the separable blend weights, crop, and write ``out`` ``(H, W, 3)``.
 
         Reads the accumulator without modifying it, so a failure part-way can be
-        retried safely (the retry moves the buffer to the output device first).
+        retried safely (the retry moves the buffer to system memory first).
         """
         out_of_memory = False
         try:
             self._finalize_rows(acc.buffer, wy, wx, out)
         except Exception as error:
-            if not is_oom(error) or acc.buffer.device == out.device:
+            if not is_oom(error) or acc.buffer.device.type == "cpu":
+                acc.buffer = None  # the traceback keeps ``acc`` alive, not its storage
                 raise
             out_of_memory = True
         if out_of_memory:
-            logger.warning("Kandinsky ImageSR: out of memory while finalising; finishing on %s", out.device)
-            acc.buffer = acc.buffer.to(out.device)
+            logger.warning("Kandinsky ImageSR: out of memory while finalising; finishing in system memory")
+            acc.buffer = acc.buffer.cpu()
             self._finalize_rows(acc.buffer, wy, wx, out)
 
     def _finalize_rows(self, buffer: torch.Tensor, wy: torch.Tensor, wx: torch.Tensor, out: torch.Tensor) -> None:

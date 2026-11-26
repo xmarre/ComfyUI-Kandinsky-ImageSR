@@ -11,6 +11,7 @@ from kandinsky_sr.memory import (
     auto_tile_batch,
     choose_accumulation_device,
     is_oom,
+    max_active_accumulators,
     transformer_tile_bytes,
 )
 
@@ -38,16 +39,48 @@ def test_transformer_estimate_scales_with_dtype():
 
 
 def test_accumulation_device_policy():
-    acc = 1 * GIB
-    assert choose_accumulation_device("cpu", GPU, CPU, acc, 80 * GIB) == CPU
-    assert choose_accumulation_device("gpu", GPU, CPU, acc, 0) == GPU
-    assert choose_accumulation_device("auto", GPU, CPU, acc, 80 * GIB) == GPU
-    assert choose_accumulation_device("auto", GPU, CPU, acc, 6 * GIB) == CPU  # 2 GiB > 25% of 6 GiB
-    assert choose_accumulation_device("auto", CPU, CPU, acc, 0) == CPU
+    acc = 2 * GIB  # total for all simultaneously live accumulators
+    assert choose_accumulation_device("cpu", GPU, acc, 80 * GIB) == CPU
+    assert choose_accumulation_device("gpu", GPU, acc, 0) == GPU
+    assert choose_accumulation_device("auto", GPU, acc, 80 * GIB) == GPU
+    assert choose_accumulation_device("auto", GPU, acc, 6 * GIB) == CPU  # 2 GiB > 25% of 6 GiB
+    assert choose_accumulation_device("auto", CPU, acc, 0) == CPU
     with pytest.raises(ValueError, match="GPU compute device"):
-        choose_accumulation_device("gpu", CPU, CPU, acc, 0)
+        choose_accumulation_device("gpu", CPU, acc, 0)
     with pytest.raises(ValueError, match="accumulation_device"):
-        choose_accumulation_device("vram", GPU, CPU, acc, 0)
+        choose_accumulation_device("vram", GPU, acc, 0)
+
+
+def test_cpu_accumulation_is_system_memory_even_with_gpu_intermediates():
+    """ComfyUI's intermediate device is the GPU under --gpu-only; 'cpu' must still mean CPU."""
+    for mode, free in (("cpu", 80 * GIB), ("auto", 1 * GIB)):
+        assert choose_accumulation_device(mode, GPU, 2 * GIB, free) == CPU
+
+
+@pytest.mark.parametrize(
+    "batch,tiles,images,expected",
+    [
+        (1, 25, 4, 1),
+        (8, 1, 8, 8),
+        (8, 1, 3, 3),
+        (8, 25, 4, 2),
+        (25, 25, 4, 2),
+        (26, 25, 4, 2),
+        (27, 25, 4, 3),
+        (4, 3, 9, 2),
+        (5, 3, 9, 3),
+    ],
+)
+def test_max_active_accumulators(batch, tiles, images, expected):
+    assert max_active_accumulators(batch, tiles, images) == expected
+
+
+def test_auto_batch_accounts_for_batch_dependent_accumulators():
+    # eight single-tile images: each extra tile also needs its own accumulator
+    per_tile, acc = 1 * GIB, 1 * GIB
+    extra = lambda b: max_active_accumulators(b, 1, 8) * acc  # noqa: E731
+    assert auto_tile_batch(10 * GIB, 0, per_tile, 8) == 8
+    assert auto_tile_batch(10 * GIB, 0, per_tile, 8, extra_bytes=extra) == 5
 
 
 def test_oom_classification():

@@ -16,6 +16,7 @@ from .memory import (
     auto_tile_batch,
     choose_accumulation_device,
     format_bytes,
+    max_active_accumulators,
     tile_io_bytes,
     transformer_tile_bytes,
 )
@@ -220,23 +221,29 @@ def upscale(
     estimate = estimate_tile_memory(model)
     per_tile = estimate.per_tile
     acc_bytes = grid.accumulation_bytes()
-    requested = tile_batch_size if tile_batch_size > 0 else 1
-    gpu_acc = 2 * acc_bytes if accumulation_device == "gpu" else 0
+
+    def live_accumulator_bytes(tiles: int) -> int:
+        return max_active_accumulators(tiles, grid.num_tiles, batch) * acc_bytes
+
+    # Reserve working memory only for tiles that can actually run in one batch.
+    requested = min(tile_batch_size, total_tiles) if tile_batch_size > 0 else 1
+    gpu_acc = live_accumulator_bytes(requested) if accumulation_device == "gpu" else 0
     mm.load_models_gpu([model.patcher, model.vae.patcher], memory_required=requested * per_tile + gpu_acc)
 
     device = model.patcher.load_device
     reserved = mm.extra_reserved_memory() if hasattr(mm, "extra_reserved_memory") else 0
     free = mm.get_free_memory(device) if device.type != "cpu" else 0
     if tile_batch_size > 0:
-        batch_size = min(tile_batch_size, total_tiles)
+        batch_size = requested
     elif device.type == "cpu":
         batch_size = 1
     else:
-        batch_size = auto_tile_batch(free, reserved + gpu_acc, per_tile, total_tiles)
-    intermediate = mm.intermediate_device()
+        extra = live_accumulator_bytes if accumulation_device == "gpu" else None
+        batch_size = auto_tile_batch(free, reserved, per_tile, total_tiles, extra_bytes=extra)
     acc_device = choose_accumulation_device(
-        accumulation_device, device, intermediate, acc_bytes, free - reserved - batch_size * per_tile
+        accumulation_device, device, live_accumulator_bytes(batch_size), free - reserved - batch_size * per_tile
     )
+    intermediate = mm.intermediate_device()
     logger.info(
         "Kandinsky ImageSR: %d image(s) %dx%d -> %dx%d, %d tiles (%dx%d grid), t=%s, tile batch %d "
         "(~%s per tile), accumulator %s on %s",

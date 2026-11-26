@@ -316,3 +316,22 @@ def test_comfy_attention_dispatch_matches_sdpa_precision(env):
     actual = comfy_attention(q, k, v, 4).float()
     rel = (actual - expected).norm() / expected.norm()
     assert rel < 6e-3, (attention.optimized_attention.__name__, rel)
+
+
+def test_explicit_batch_reserves_memory_only_for_runnable_tiles(env, monkeypatch):
+    import comfy.model_management as mm
+
+    import kandinsky_sr.runtime as runtime
+
+    model = _load(env)
+    requested = []
+    real = mm.load_models_gpu
+
+    def spy(models, memory_required=0, **kwargs):
+        requested.append(memory_required)
+        return real(models, memory_required=memory_required, **kwargs)
+
+    monkeypatch.setattr(mm, "load_models_gpu", spy)
+    per_tile = runtime.estimate_tile_memory(model).per_tile
+    _run(env, model, _image(), tile_batch_size=64)  # a single-tile image
+    assert requested == [per_tile]

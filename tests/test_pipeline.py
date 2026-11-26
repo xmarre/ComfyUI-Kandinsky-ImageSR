@@ -280,3 +280,107 @@ def test_cpu_and_gpu_accumulation_agree():
     opts.accumulation_device = torch.device("cuda")
     gpu, _ = TiledRestorer(FakeBackend(), grid).run(images, opts)
     torch.testing.assert_close(gpu, cpu, rtol=0, atol=1e-6)
+
+
+class _LiveAccumulators:
+    """Counts live ``_Accumulator`` objects (released by refcounting in CPython)."""
+
+    def __init__(self, monkeypatch, limit=None):
+        import weakref
+
+        self.live = self.peak = 0
+        self.refs = []
+        real = pl._Accumulator.__init__
+        tracker = self
+
+        def init(acc, grid, device):
+            if limit is not None and tracker.live + 1 > limit:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory (accumulator)")
+            real(acc, grid, device)
+            tracker.live += 1
+            tracker.peak = max(tracker.peak, tracker.live)
+            tracker.refs.append(weakref.ref(acc))
+            weakref.finalize(acc, tracker._release)
+
+        monkeypatch.setattr(pl._Accumulator, "__init__", init)
+
+    def _release(self):
+        self.live -= 1
+
+
+class BudgetBackend(FakeBackend):
+    """Encode fails when the batch plus live accumulators exceed ``budget`` units."""
+
+    def __init__(self, tracker, budget):
+        super().__init__()
+        self.tracker, self.budget = tracker, budget
+
+    def encode(self, pixels):
+        if self.tracker.live + pixels.shape[0] > self.budget:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory (activations)")
+        return super().encode(pixels)
+
+
+def test_failed_attempt_releases_the_accumulators_it_created(monkeypatch):
+    """Accumulators allocated by a failed attempt must not survive into the retry."""
+    images = _images(4, 64, 64)  # one tile per image
+    grid = make_grid(64, 64, 2, TILE, 0.25)
+    expected, _ = TiledRestorer(FakeBackend(), grid).run(images, _opts(1))
+    tracker = _LiveAccumulators(monkeypatch, limit=3)  # the 4th accumulator of the first attempt fails
+    out, stats = TiledRestorer(BudgetBackend(tracker, budget=4), grid).run(images, _opts(4))
+    assert torch.equal(out, expected)
+    # With the three orphaned accumulators kept alive, the batch-2 retry would need
+    # 3 + 2 > 4 units and fail again; releasing them makes it the only retry.
+    assert stats.oom_retries == 1 and stats.batch_sizes == [2, 2]
+    assert tracker.live == 0
+
+
+@pytest.mark.parametrize("h,w,batch,size", [(64, 64, 8, 8), (64, 64, 5, 3), (150, 170, 3, 4), (150, 170, 2, 7)])
+def test_live_accumulators_never_exceed_the_budgeted_bound(monkeypatch, h, w, batch, size):
+    from kandinsky_sr.memory import max_active_accumulators
+
+    grid = make_grid(h, w, 2, TILE, 0.25)
+    tracker = _LiveAccumulators(monkeypatch)
+    TiledRestorer(FakeBackend(), grid).run(_images(batch, h, w), _opts(size))
+    assert tracker.peak <= max_active_accumulators(size, grid.num_tiles, batch)
+    assert tracker.live == 0
+
+
+def test_buffers_are_released_after_finalisation_and_on_cancellation(monkeypatch):
+    images = _images(2, 150, 170)
+    grid = make_grid(150, 170, 2, TILE, 0.25)
+    tracker = _LiveAccumulators(monkeypatch)
+    seen = {"first_dead": None}
+
+    def interrupt():
+        # once image 1 has an accumulator, image 0 has been finalised
+        if len(tracker.refs) == 2 and seen["first_dead"] is None:
+            seen["first_dead"] = tracker.refs[0]() is None
+
+    TiledRestorer(FakeBackend(), grid).run(images, _opts(1, interrupt=interrupt))
+    assert seen["first_dead"] is True  # released while image 1 was still processing
+    assert tracker.live == 0
+
+    class Cancelled(Exception):
+        pass
+
+    calls = {"n": 0}
+
+    def cancel():
+        calls["n"] += 1
+        if calls["n"] > 5:  # 4 checks per batch: cancels inside the second batch
+            raise Cancelled
+
+    tracker2 = _LiveAccumulators(monkeypatch)
+    with pytest.raises(Cancelled) as info:
+        TiledRestorer(FakeBackend(), grid).run(images, _opts(1, interrupt=cancel))
+    # the traceback (and so the run() frame) is still alive here
+    assert info.value.__traceback__ is not None
+    assert tracker2.refs and all(ref() is None for ref in tracker2.refs)
+    frames = []
+    tb = info.value.__traceback__
+    while tb is not None:
+        frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    run_frame = next(f for f in frames if f.f_code.co_name == "run")
+    assert run_frame.f_locals.get("output") is None
