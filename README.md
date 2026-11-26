@@ -250,6 +250,37 @@ velocity for all 18 creativity presets, decoded tiles, final image). The
 reference phase runs in a separate environment with the official package, so it
 never touches the ComfyUI environment.
 
+### Measured real-checkpoint parity (CPU)
+
+Measured on CPU (PyTorch 2.15, bf16 weights and VAE) against the official
+pipeline with its transformer under bf16 autocast, the mode the official CUDA
+path uses. ComfyUI was run with `--use-pytorch-cross-attention` (ComfyUI's
+default on current CUDA setups). Inputs were public-domain/CC0 photographs.
+
+| Stage | Result |
+|---|---|
+| Bicubic tiles fed to the VAE | bitwise identical |
+| Transformer velocity, identical latents, all 18 creativity presets | **bitwise identical** |
+| VAE encoder, fp32, ComfyUI vs Diffusers implementation | relative RMS 8.7e-8 |
+| VAE encoder, bf16, same batch size | relative RMS ≈ 1e-3 (different bf16 kernels) |
+| Final image, tile batch 1 (3 cases: 2x c4, 4x c0, 4x c8) | PSNR 53.6 / 53.5 / 46.5 dB vs. official output |
+| Final image, tile batch 2 here vs. 1 in the reference (2x c4) | PSNR 48.9 dB |
+
+The remaining end-to-end difference is bf16 rounding in the VAE, amplified by
+the transformer: a 1e-3 relative change of the latents changes the velocity by
+1.5–6 %. The bf16 VAE is intrinsically sensitive (bf16 vs. fp32 encoding of the
+same tile differs by about 5 % relative RMS). The tile batch size changes which
+bf16 kernels run, so it changes results at this level too (latent difference
+0.1 % at equal batch size, 2.3 % at batch 2 vs. 1); the official pipeline is
+subject to the same mechanism. These figures are CPU measurements; CUDA parity
+is checked with the script above.
+
+Attention backend matters: ComfyUI's split/sub-quadratic/basic attention compute
+scores in bf16 unless asked to upcast; this package requests FP32 score
+precision, which brings those backends to within 0.25 % of SDPA (from 2–3 %).
+Backends with their own quantization (e.g. SageAttention) are used as
+configured and are not qualified.
+
 ## Troubleshooting
 
 - **The loader shows "(no Kandinsky ImageSR bundle found)"**: the bundle folder
@@ -275,8 +306,10 @@ never touches the ComfyUI environment.
   implemented.
 - The transformer is managed by ComfyUI's standard `ModelPatcher`; LoRA or other
   weight patches for this model are not supported.
-- Visual quality and performance on GPUs have not yet been characterised by this
-  project; see the qualification workflow above.
+- Visual quality has only been spot-checked on a few public-domain photographs;
+  GPU performance has not been measured by this project. Use
+  `04_Qualification_Grid.json` and `scripts/benchmark.py` on your own data and
+  hardware.
 
 ## Attribution and licenses
 

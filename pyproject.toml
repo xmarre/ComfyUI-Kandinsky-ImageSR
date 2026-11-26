@@ -16,7 +16,6 @@ Repository = "https://github.com/xmarre/ComfyUI-Kandinsky-ImageSR"
 [tool.comfy]
 PublisherId = "xmarre"
 DisplayName = "Kandinsky ImageSR"
-Icon = ""
 includes = []
 
 [tool.pytest.ini_options]
