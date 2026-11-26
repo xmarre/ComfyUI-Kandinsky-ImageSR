@@ -19,22 +19,71 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def env(comfy, tmp_path_factory):
+    import sys
+
+    import comfy.diffusers_convert
+    import comfy.sd
+    import comfy.utils
     import folder_paths
+    from safetensors.torch import load_file, save_file
 
     import nodes
+    from kandinsky_sr import vae as test_vae_module
+    from tests.helpers import write_single_file
 
     models = tmp_path_factory.mktemp("models")
-    write_bundle(models / "Kandinsky-ImageSR-2.0", small_transformer_config(latent=16), published_vae_config(), seed=0)
-    write_bundle(
+    extra = tmp_path_factory.mktemp("extra_models")
+    bundle = write_bundle(models / "Kandinsky-ImageSR-2.0", small_transformer_config(latent=16), published_vae_config())
+    alt = write_bundle(
         models / "variants" / "ImageSR-alt", small_transformer_config(latent=16), published_vae_config(), seed=5
     )
+    write_single_file(models / "kandinsky_imagesr_2.0.safetensors", bundle)
+    write_single_file(models / "nested" / "deeper" / "ksr_alt.safetensors", alt)
+    write_single_file(extra / "extra_ksr.safetensors", bundle)
+    save_file({"x": torch.zeros(2)}, str(models / "unrelated_model.safetensors"))
     folder_paths.add_model_folder_path("diffusion_models", str(models))
+    folder_paths.add_model_folder_path("diffusion_models", str(extra))
+
+    # A FLUX-format (LDM key) VAE file, loaded exactly like the core Load VAE node does.
+    vae_file = tmp_path_factory.mktemp("vae") / "ae.safetensors"
+    state = comfy.diffusers_convert.convert_vae_state_dict(load_file(str(bundle / "vae" / VAE_WEIGHTS)))
+    save_file({k: v.float().contiguous() for k, v in state.items()}, str(vae_file))
+
+    def load_vae(dtype=None):
+        return comfy.sd.VAE(sd=comfy.utils.load_torch_file(str(vae_file)), dtype=dtype)
+
     assert asyncio.run(nodes.load_custom_node(str(ROOT)))
-    return {
+    upscale = nodes.NODE_CLASS_MAPPINGS["KandinskyImageSRUpscale"]
+    prefix = upscale.__module__.rsplit(".", 1)[0]  # ComfyUI imports the package under its path
+
+    def module(name):
+        return sys.modules[f"{prefix}.kandinsky_sr.{name}"]
+
+    # The synthetic VAE stands in for FLUX.1: make it the identity reference for both
+    # the node's copy of the package and the tests' import of it.
+    reference = {"source": "synthetic"}
+    sd = load_vae(torch.float32).first_stage_model.state_dict()
+    for names in test_vae_module.FINGERPRINT_TENSORS.values():
+        for n in names:
+            reference[n] = test_vae_module.tensor_fingerprint(sd[n])
+    originals = []
+    for mod in (module("vae"), test_vae_module):
+        originals.append((mod, mod.load_reference_fingerprint))
+        mod.load_reference_fingerprint = lambda reference=reference: reference
+    yield {
         "loader": nodes.NODE_CLASS_MAPPINGS["KandinskyImageSRLoader"],
-        "upscale": nodes.NODE_CLASS_MAPPINGS["KandinskyImageSRUpscale"],
+        "upscale": upscale,
         "models": models,
+        "extra": extra,
+        "module": module,
+        "load_vae": load_vae,
+        "vae_file": vae_file,
     }
+    for mod, original in originals:
+        mod.load_reference_fingerprint = original
+
+
+VAE_WEIGHTS = "diffusion_pytorch_model.safetensors"
 
 
 def _options(spec):
@@ -48,6 +97,7 @@ def _image(batch=1, h=40, w=56, seed=0):
 
 
 def _load(env, name="Kandinsky-ImageSR-2.0", weight_dtype="bf16"):
+    """Load through the loader node; the default name is the official bundle layout."""
     return env["loader"].execute(model_name=name, weight_dtype=weight_dtype, vae_dtype="fp32").result[0]
 
 
@@ -63,9 +113,17 @@ def test_node_registration_and_schema(env):
     assert nodes.NODE_DISPLAY_NAME_MAPPINGS["KandinskyImageSRLoader"] == "Kandinsky ImageSR Loader"
     loader = env["loader"].GET_NODE_INFO_V1()
     required = loader["input"]["required"]
-    assert _options(required["model_name"]) == ["Kandinsky-ImageSR-2.0", "variants/ImageSR-alt"]
+    # single-file checkpoints (root, nested folder, extra model path) first, then bundles;
+    # the unrelated safetensors file is not listed
+    assert _options(required["model_name"]) == [
+        "extra_ksr.safetensors",
+        "kandinsky_imagesr_2.0.safetensors",
+        "nested/deeper/ksr_alt.safetensors",
+        "Kandinsky-ImageSR-2.0",
+        "variants/ImageSR-alt",
+    ]
     assert _options(required["weight_dtype"]) == ["default", "bf16", "fp32"]
-    assert loader["output"] == ["KANDINSKY_SR_MODEL"]
+    assert loader["output"] == ["KANDINSKY_IMAGESR_MODEL"]
     up = env["upscale"].GET_NODE_INFO_V1()
     req = up["input"]["required"]
     assert list(req) == [
@@ -77,7 +135,9 @@ def test_node_registration_and_schema(env):
         "tile_batch_size",
         "accumulation_device",
     ]
-    assert req["sr_model"][0] == "KANDINSKY_SR_MODEL" and req["image"][0] == "IMAGE"
+    # accepts the legacy type name so saved links stay valid
+    assert req["sr_model"][0] == "KANDINSKY_IMAGESR_MODEL,KANDINSKY_SR_MODEL" and req["image"][0] == "IMAGE"
+    assert list(up["input"]["optional"]) == ["vae"] and up["input"]["optional"]["vae"][0] == "VAE"
     assert _options(req["upscale_factor"]) == ["2x", "4x"] and req["upscale_factor"][1]["default"] == "2x"
     assert req["creativity"][1] == {**req["creativity"][1], "default": 4, "min": 0, "max": 8}
     assert req["overlap"][1]["default"] == 0.25
@@ -115,16 +175,22 @@ def test_rgba_alpha_is_resized_not_generated(env):
 
 
 def test_repeated_execution_does_not_reload(env, monkeypatch):
-    import kandinsky_sr.runtime as runtime
-
-    model = _load(env)
+    runtime = env["module"]("runtime")  # the node's own copy of the package
+    real = runtime.load_transformer_state_dict
     calls = []
-    monkeypatch.setattr(runtime, "load_transformer_state_dict", lambda *a, **k: calls.append(1))
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "load_transformer_state_dict", counting)
+    model = _load(env)
+    assert calls == [1]  # the patch is effective
     image = _image()
     a = _run(env, model, image, creativity=2)
     b = _run(env, model, image, creativity=6)
     c = _run(env, model, image, creativity=2)
-    assert calls == [] and torch.equal(a, c) and not torch.equal(a, b)
+    assert calls == [1] and torch.equal(a, c) and not torch.equal(a, b)
 
 
 def test_model_switching_and_unloading(env):
@@ -165,10 +231,18 @@ def test_input_validation(env):
         _run(env, object(), _image())
 
 
-def test_missing_bundle_error(env):
+def test_foreign_model_objects_get_an_explicit_error(env):
+    class KandinskySRModel:  # same class name as another node pack's object
+        transformer = patcher = None
+
+    with pytest.raises(TypeError, match="another node pack"):
+        _run(env, KandinskySRModel(), _image())
+
+
+def test_missing_checkpoint_error(env):
     with pytest.raises(ValueError, match="models/diffusion_models"):
         env["loader"].execute(
-            model_name="(no Kandinsky ImageSR bundle found)", weight_dtype="default", vae_dtype="default"
+            model_name="(no Kandinsky ImageSR checkpoint found)", weight_dtype="default", vae_dtype="default"
         )
 
 
@@ -177,9 +251,14 @@ def test_weight_dtype_choices(env):
     assert model.weight_dtype == torch.float32
     assert model.transformer.time_embed_table.dtype == torch.float32
     assert model.transformer.visual_embeddings.in_layer.weight.dtype == torch.float32
+    block = model.transformer.visual_transformer_blocks[0]
+    assert block.visual_modulation.out_layer.weight.dtype == torch.float32
     model = _load(env, weight_dtype="bf16")
+    block = model.transformer.visual_transformer_blocks[0]
     assert model.transformer.visual_embeddings.in_layer.weight.dtype == torch.bfloat16
-    assert model.transformer.visual_transformer_blocks[0].visual_modulation.out_layer.weight.dtype == torch.float32
+    # modulation projections are stored as the BF16 values autocast would use; tables stay FP32
+    assert block.visual_modulation.out_layer.weight.dtype == torch.bfloat16
+    assert block.xattn_bias_table.dtype == torch.float32 and model.transformer.time_embed_table.dtype == torch.float32
 
 
 def test_interrupt_is_honoured(env):
@@ -321,8 +400,7 @@ def test_comfy_attention_dispatch_matches_sdpa_precision(env):
 def test_explicit_batch_reserves_memory_only_for_runnable_tiles(env, monkeypatch):
     import comfy.model_management as mm
 
-    import kandinsky_sr.runtime as runtime
-
+    runtime = env["module"]("runtime")
     model = _load(env)
     requested = []
     real = mm.load_models_gpu
@@ -332,6 +410,74 @@ def test_explicit_batch_reserves_memory_only_for_runnable_tiles(env, monkeypatch
         return real(models, memory_required=memory_required, **kwargs)
 
     monkeypatch.setattr(mm, "load_models_gpu", spy)
-    per_tile = runtime.estimate_tile_memory(model).per_tile
+    per_tile = runtime.estimate_tile_memory(model, model.bundled_vae()).per_tile
     _run(env, model, _image(), tile_batch_size=64)  # a single-tile image
     assert requested == [per_tile]
+
+
+# ----------------------------------------------------------------------------- single-file checkpoints and VAEs
+
+
+def test_single_file_with_connected_vae_matches_bundle(env):
+    """Same weights through both formats, bundled VAE vs. the same VAE from Load VAE: identical output."""
+    image = _image(batch=2)
+    bundle_out = _run(env, _load(env), image)  # bundled VAE, loaded in fp32 by _load
+    single = _load(env, "kandinsky_imagesr_2.0.safetensors")
+    assert single.bundle.kind == "single_file" and not single.has_bundled_vae
+    single_out = _run(env, single, image, vae=env["load_vae"](torch.float32))
+    assert torch.equal(single_out, bundle_out)
+    # the bundle with a connected VAE uses the connected one
+    assert torch.equal(_run(env, _load(env), image, vae=env["load_vae"](torch.float32)), bundle_out)
+    # nested folders and extra model paths load as well
+    assert _load(env, "extra_ksr.safetensors").bundle.root == env["extra"] / "extra_ksr.safetensors"
+    assert _load(env, "nested/deeper/ksr_alt.safetensors").bundle.kind == "single_file"
+
+
+def test_single_file_requires_a_vae(env):
+    single = _load(env, "kandinsky_imagesr_2.0.safetensors")
+    with pytest.raises(ValueError, match="connect the FLUX.1 VAE"):
+        _run(env, single, _image())
+
+
+def test_incompatible_vaes_are_rejected(env):
+    import comfy.sd
+
+    vae_module = env["module"]("vae")
+    single = _load(env, "kandinsky_imagesr_2.0.safetensors")
+    with pytest.raises(vae_module.IncompatibleVAEError, match="not a ComfyUI VAE"):
+        _run(env, single, _image(), vae=object())
+    # same architecture, different encoder weights (e.g. the SD3 VAE)
+    good = env["load_vae"](torch.float32).first_stage_model.state_dict()
+    gen = torch.Generator().manual_seed(123)
+    other = {k: v + 0.05 * torch.randn(v.shape, generator=gen) * v.std().clamp_min(1e-3) for k, v in good.items()}
+    with pytest.raises(vae_module.IncompatibleVAEError, match="encoder weights"):
+        _run(env, single, _image(), vae=comfy.sd.VAE(sd=other, dtype=torch.float32))
+    # an SD1-style 4-channel VAE
+    sd1 = dict(good)
+    sd1["decoder.conv_in.weight"] = torch.zeros(512, 4, 3, 3)
+    sd1["encoder.conv_out.weight"] = torch.zeros(8, 512, 3, 3)
+    sd1["encoder.conv_out.bias"] = torch.zeros(8)
+    with pytest.raises(vae_module.IncompatibleVAEError, match="latent channels"):
+        _run(env, single, _image(), vae=comfy.sd.VAE(sd=sd1, dtype=torch.float32))
+
+
+def test_connected_vae_is_not_mutated_and_not_retained(env):
+    import comfy.model_management as mm
+
+    vae = env["load_vae"](torch.float32)
+    before = {k: v.detach().clone() for k, v in vae.first_stage_model.state_dict().items()}
+    attrs = (vae.vae_dtype, vae.device, vae.patcher.load_device, vae.patcher.offload_device, vae.output_device)
+    pixels = _image()
+    decoded_before = vae.decode(vae.encode(pixels))
+    single = _load(env, "kandinsky_imagesr_2.0.safetensors")
+    _run(env, single, pixels, vae=vae)
+    after = vae.first_stage_model.state_dict()
+    assert all(torch.equal(before[k], after[k].to(before[k].device)) for k in before)
+    assert (vae.vae_dtype, vae.device, vae.patcher.load_device, vae.patcher.offload_device, vae.output_device) == attrs
+    assert torch.equal(vae.decode(vae.encode(pixels)), decoded_before)  # other workflow branches unaffected
+    ref = weakref.ref(vae.first_stage_model)
+    del vae, after, before
+    mm.unload_all_models()
+    gc.collect()
+    assert ref() is None, "the connected VAE is kept alive by the ImageSR model"
+    assert single._bundled_vae is None

@@ -68,6 +68,7 @@ def write_bundle(
     shards: int = 2,
     seed: int = 0,
     tile_size: int | None = None,
+    vae_seed: int = 1,
 ) -> Path:
     """Write a synthetic bundle with the published file layout and random weights."""
     from safetensors.torch import save_file
@@ -100,7 +101,7 @@ def write_bundle(
     (root / "transformer" / "diffusion_pytorch_model.safetensors.index.json").write_text(
         json.dumps({"metadata": {"total_size": total}, "weight_map": weight_map})
     )
-    gen = torch.Generator().manual_seed(seed + 1)
+    gen = torch.Generator().manual_seed(vae_seed)
     vae_state = {}
     for name, shape in expected_vae_shapes(vae_cfg).items():
         if name.endswith(("norm1.weight", "norm2.weight", "group_norm.weight", "conv_norm_out.weight")):
@@ -121,3 +122,38 @@ def tiny_vae_config() -> dict:
     cfg = published_vae_config()
     cfg["block_out_channels"] = [32, 32, 32, 32]
     return cfg
+
+
+def converter():
+    """The ``scripts/convert_to_single_file.py`` module."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "convert_to_single_file.py"
+    spec = importlib.util.spec_from_file_location("convert_to_single_file", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_single_file(path: Path, bundle: Path) -> Path:
+    """Convert a (synthetic) bundle with the shipped converter."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    converter().convert(bundle, path)
+    return path
+
+
+def rewrite_safetensors(path: Path, edit_header=None, edit_data=None) -> None:
+    """Rewrite a safetensors file with a modified header and/or data section (for corruption tests)."""
+    import struct
+
+    raw = path.read_bytes()
+    (length,) = struct.unpack("<Q", raw[:8])
+    header = json.loads(raw[8 : 8 + length])
+    data = raw[8 + length :]
+    if edit_header is not None:
+        edit_header(header)
+    if edit_data is not None:
+        data = edit_data(data)
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + data)

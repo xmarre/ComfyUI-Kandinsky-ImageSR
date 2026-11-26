@@ -9,7 +9,7 @@ from comfy_api.latest import ComfyExtension, io
 from typing_extensions import override
 
 from .kandinsky_sr import config as cfg
-from .kandinsky_sr.loader import discover_bundles
+from .kandinsky_sr.loader import discover_bundles, is_single_file_checkpoint
 from .kandinsky_sr.runtime import (
     ACCUMULATION_MODES,
     VAE_DTYPES,
@@ -21,9 +21,18 @@ from .kandinsky_sr.runtime import (
 
 logger = logging.getLogger(__name__)
 
-KandinskySRModelType = io.Custom("KANDINSKY_SR_MODEL")
+#: Connection type produced by the loader. A different node pack uses the generic name
+#: "KANDINSKY_SR_MODEL" for an incompatible object, so the loader outputs a
+#: package-specific type that cannot be wired into that pack's nodes.
+MODEL_TYPE = "KANDINSKY_IMAGESR_MODEL"
+#: Type name used by earlier versions of these nodes; still accepted by the upscale
+#: input so saved workflows keep their links. Foreign objects arriving this way are
+#: rejected with an explicit error.
+LEGACY_MODEL_TYPE = "KANDINSKY_SR_MODEL"
+KandinskySRModelType = io.Custom(MODEL_TYPE)
+KandinskySRModelInputType = io.Custom(f"{MODEL_TYPE},{LEGACY_MODEL_TYPE}")
 
-NO_MODEL = "(no Kandinsky ImageSR bundle found)"
+NO_MODEL = "(no Kandinsky ImageSR checkpoint found)"
 FACTOR_OPTIONS = {"2x": 2, "4x": 4}
 CATEGORY = "image/upscaling/Kandinsky ImageSR"
 
@@ -43,9 +52,30 @@ def _search_roots() -> list[str]:
     return list(folder_paths.get_folder_paths("diffusion_models"))
 
 
-def _bundle_names() -> list[str]:
-    names = list(discover_bundles(_search_roots()))
-    return names or [NO_MODEL]
+def discover_models() -> dict[str, str]:
+    """Single-file checkpoints (listed first) and official bundle folders.
+
+    Single files come from ComfyUI's ``diffusion_models`` file list (all configured
+    paths, nested folders included); only their safetensors headers are read, and
+    the result is cached per file. Bundles are folders found directly in a
+    ``diffusion_models`` root or one level below it.
+    """
+    import folder_paths
+
+    models: dict[str, str] = {}
+    for name in folder_paths.get_filename_list("diffusion_models"):
+        if not name.lower().endswith(".safetensors"):
+            continue
+        path = folder_paths.get_full_path("diffusion_models", name)
+        if path and is_single_file_checkpoint(path):
+            models[name] = path
+    for name, path in discover_bundles(_search_roots()).items():
+        models.setdefault(name, str(path))
+    return models
+
+
+def _model_names() -> list[str]:
+    return list(discover_models()) or [NO_MODEL]
 
 
 class KandinskyImageSRLoader(io.ComfyNode):
@@ -56,18 +86,19 @@ class KandinskyImageSRLoader(io.ComfyNode):
             display_name="Kandinsky ImageSR Loader",
             category=CATEGORY,
             description=(
-                "Loads an unmodified Kandinsky-ImageSR-2.0 Hugging Face bundle (baked transformer and FLUX VAE) "
-                "from a folder inside models/diffusion_models. The bundle is validated tensor by tensor before "
-                "any weights are read."
+                "Loads the Kandinsky ImageSR 2.0 transformer from models/diffusion_models: the single-file checkpoint "
+                "kandinsky_imagesr_2.0.safetensors (use it with the FLUX.1 VAE from Load VAE) or the unmodified "
+                "Hugging Face bundle folder. The checkpoint is validated tensor by tensor before any weights are read."
             ),
             search_aliases=["kandinsky", "imagesr", "super resolution", "upscale", "restoration"],
             inputs=[
                 io.Combo.Input(
                     "model_name",
-                    options=_bundle_names(),
+                    options=_model_names(),
                     tooltip=(
-                        "Bundle folder found in models/diffusion_models (or a configured extra path). The folder must "
-                        "contain model_index.json, transformer/ and vae/ exactly as published on Hugging Face."
+                        "Single-file checkpoint (kandinsky_imagesr_2.0.safetensors) or official bundle folder in "
+                        "models/diffusion_models or a configured extra path. Only Kandinsky ImageSR checkpoints are "
+                        "listed."
                     ),
                 ),
                 io.Combo.Input(
@@ -76,15 +107,18 @@ class KandinskyImageSRLoader(io.ComfyNode):
                     default="default",
                     tooltip=(
                         "Transformer precision. 'default' picks bf16 on hardware that supports it and fp32 otherwise. "
-                        "bf16 reproduces the official mixed-precision inference (modulation and conditioning tables "
-                        "stay fp32). fp32 doubles weight memory and is mainly useful on GPUs without bf16 support."
+                        "bf16 reproduces the official mixed-precision inference (conditioning tables stay fp32). fp32 "
+                        "doubles weight memory and is mainly useful on GPUs without bf16 support."
                     ),
                 ),
                 io.Combo.Input(
                     "vae_dtype",
                     options=list(VAE_DTYPES),
                     default="default",
-                    tooltip="FLUX VAE precision. 'default' follows ComfyUI's VAE precision selection (bf16 or fp32).",
+                    tooltip=(
+                        "Precision of the official bundle's own VAE, used only when no VAE is connected to the "
+                        "upscale node. 'default' follows ComfyUI's VAE precision selection (bf16 or fp32)."
+                    ),
                 ),
             ],
             outputs=[KandinskySRModelType.Output(display_name="sr_model")],
@@ -92,14 +126,15 @@ class KandinskyImageSRLoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, model_name: str, weight_dtype: str, vae_dtype: str) -> io.NodeOutput:
-        bundles = discover_bundles(_search_roots())
-        if model_name not in bundles:
+        models = discover_models()
+        if model_name not in models:
             raise ValueError(
-                f"Kandinsky ImageSR bundle {model_name!r} was not found. Download "
-                "https://huggingface.co/kandinskylab/Kandinsky-ImageSR-2.0 and place the whole repository folder "
-                "(model_index.json, transformer/, vae/) in ComfyUI/models/diffusion_models/, then refresh."
+                f"Kandinsky ImageSR checkpoint {model_name!r} was not found. Place kandinsky_imagesr_2.0.safetensors "
+                "(https://huggingface.co/hmdlsk/Kandinsky-ImageSR-2.0-ComfyUI) or the official bundle folder "
+                "(https://huggingface.co/kandinskylab/Kandinsky-ImageSR-2.0) in ComfyUI/models/diffusion_models/, "
+                "then refresh."
             )
-        model = load_model(bundles[model_name], model_name, weight_dtype=weight_dtype, vae_dtype=vae_dtype)
+        model = load_model(models[model_name], model_name, weight_dtype=weight_dtype, vae_dtype=vae_dtype)
         return io.NodeOutput(model)
 
 
@@ -117,7 +152,7 @@ class KandinskyImageSRUpscale(io.ComfyNode):
             ),
             search_aliases=["kandinsky", "imagesr", "super resolution", "upscale", "restore"],
             inputs=[
-                KandinskySRModelType.Input("sr_model"),
+                KandinskySRModelInputType.Input("sr_model"),
                 io.Image.Input("image"),
                 io.Combo.Input(
                     "upscale_factor",
@@ -169,6 +204,15 @@ class KandinskyImageSRUpscale(io.ComfyNode):
                         "it fits comfortably in free VRAM, otherwise system RAM."
                     ),
                 ),
+                io.Vae.Input(
+                    "vae",
+                    optional=True,
+                    tooltip=(
+                        "FLUX.1 VAE (ae.safetensors from Load VAE). Required for the single-file checkpoint; optional "
+                        "for the official bundle, whose own VAE is used when nothing is connected. The connected VAE "
+                        "is used as is and not modified."
+                    ),
+                ),
             ],
             outputs=[io.Image.Output()],
         )
@@ -183,9 +227,15 @@ class KandinskyImageSRUpscale(io.ComfyNode):
         overlap: float,
         tile_batch_size: int,
         accumulation_device: str,
+        vae=None,
     ) -> io.NodeOutput:
         if not isinstance(sr_model, KandinskySRModel):
-            raise TypeError("sr_model must come from the Kandinsky ImageSR Loader node")
+            origin = type(sr_model).__module__
+            raise TypeError(
+                f"sr_model must come from the 'Kandinsky ImageSR Loader' node of this package; received "
+                f"{type(sr_model).__name__} from {origin!r}, which is another node pack's model object and cannot "
+                "be used here."
+            )
         if upscale_factor not in FACTOR_OPTIONS:
             raise ValueError(f"upscale_factor must be one of {list(FACTOR_OPTIONS)}, got {upscale_factor!r}")
         output, _stats = upscale(
@@ -196,6 +246,7 @@ class KandinskyImageSRUpscale(io.ComfyNode):
             overlap=float(overlap),
             tile_batch_size=int(tile_batch_size),
             accumulation_device=accumulation_device,
+            vae=vae,
         )
         return io.NodeOutput(output)
 

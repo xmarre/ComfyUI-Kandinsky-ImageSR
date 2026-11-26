@@ -1,6 +1,15 @@
-"""Discovery, strict validation and memory-efficient loading of the official bundle.
+"""Discovery, strict validation and memory-efficient loading of model checkpoints.
 
-Expected layout (the unmodified Hugging Face repository)::
+Two equivalent representations of the transformer are supported.
+
+Single-file checkpoint (preferred): one ``.safetensors`` file with the
+transformer tensors under their original names, shapes, dtypes and bytes, and
+safetensors metadata ``format = kandinsky_image_sr_single_file``,
+``format_version = 1`` and the bundle's ``transformer_config``, ``vae_config`` and
+``model_index`` as JSON strings. It holds no VAE; the FLUX.1 VAE is loaded
+separately.
+
+Official Hugging Face bundle (the unmodified repository)::
 
     <bundle>/
         model_index.json
@@ -10,9 +19,10 @@ Expected layout (the unmodified Hugging Face repository)::
         vae/config.json
         vae/diffusion_pytorch_model.safetensors
 
-Validation reads only JSON files and safetensors headers. Every tensor name, shape
-and dtype is checked against the architecture in ``transformer/config.json``; a
-bundle with a missing, duplicated, unexpected, truncated or mis-shaped tensor is
+Validation reads only JSON and safetensors headers. Both forms go through the
+same configuration parser and the same tensor checks: every tensor name, shape
+and storage dtype is compared with the architecture, and a checkpoint with a
+missing, duplicated, unexpected, overlapping, truncated or mis-shaped tensor is
 rejected before any weights are read. There are no permitted extra tensors.
 """
 
@@ -37,6 +47,10 @@ from .config import (
 )
 
 INDEX_NAME = "diffusion_pytorch_model.safetensors.index.json"
+SINGLE_FILE_FORMAT = "kandinsky_image_sr_single_file"
+SINGLE_FILE_FORMAT_VERSION = "1"
+#: Headers larger than this are not inspected during discovery (not a candidate).
+_DISCOVERY_MAX_HEADER_BYTES = 16 * 1024 * 1024
 VAE_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 _MAX_HEADER_BYTES = 100 * 1024 * 1024
 _DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "F16": torch.float16}
@@ -52,18 +66,37 @@ class TensorInfo:
 
 @dataclass(frozen=True)
 class BundleInfo:
+    """A validated checkpoint: official bundle directory or single-file checkpoint."""
+
     root: Path
     transformer_config: TransformerConfig
     vae_scaling_factor: float
     tensors: dict[str, TensorInfo]
-    vae_path: Path
+    #: Bundled VAE weights (official bundle only); ``None`` for single-file checkpoints.
+    vae_path: Path | None
+    kind: str = "bundle"
 
 
 # --------------------------------------------------------------------------- safetensors headers
 
 
-def read_safetensors_header(path: Path) -> dict[str, Any]:
-    """Parse a safetensors header and verify the file is not truncated."""
+def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise BundleError(f"duplicate entry {key!r} in safetensors header")
+        result[key] = value
+    return result
+
+
+def read_safetensors(path: Path, max_header: int = _MAX_HEADER_BYTES) -> tuple[dict[str, Any], dict[str, str]]:
+    """Parse and check a safetensors header; returns ``(tensor entries, metadata)``.
+
+    Verifies that no name is duplicated, every tensor's byte range matches its
+    shape and dtype, the ranges tile the data section without gaps or overlaps, and
+    the file is neither truncated nor followed by stray data.
+    """
+    path = Path(path)
     try:
         size = path.stat().st_size
         with open(path, "rb") as handle:
@@ -71,17 +104,19 @@ def read_safetensors_header(path: Path) -> dict[str, Any]:
             if len(prefix) != 8:
                 raise BundleError(f"{path} is not a safetensors file (too short)")
             (length,) = struct.unpack("<Q", prefix)
-            if length <= 0 or length > _MAX_HEADER_BYTES or 8 + length > size:
+            if length <= 0 or length > max_header or 8 + length > size:
                 raise BundleError(f"{path} has an invalid safetensors header")
-            header = json.loads(handle.read(length))
+            header = json.loads(handle.read(length), object_pairs_hook=_reject_duplicates)
     except FileNotFoundError as error:
         raise BundleError(f"missing weight file: {path}") from error
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
         raise BundleError(f"cannot read safetensors header of {path}: {error}") from error
     if not isinstance(header, dict):
         raise BundleError(f"{path} has an invalid safetensors header")
-    header.pop("__metadata__", None)
-    data_end = 0
+    metadata = header.pop("__metadata__", None) or {}
+    if not isinstance(metadata, dict) or not all(isinstance(v, str) for v in metadata.values()):
+        raise BundleError(f"{path} has malformed safetensors metadata")
+    ranges = []
     for name, entry in header.items():
         try:
             start, end = (int(v) for v in entry["data_offsets"])
@@ -96,10 +131,22 @@ def read_safetensors_header(path: Path) -> dict[str, Any]:
                 count *= dim
             if end - start != count * item:
                 raise BundleError(f"{path}: tensor {name!r} has inconsistent size")
-        data_end = max(data_end, end)
-    if 8 + length + data_end > size:
-        raise BundleError(f"{path} is truncated (expected at least {8 + length + data_end} bytes, found {size})")
-    return header
+        ranges.append((start, end, name))
+    position = 0
+    for start, end, name in sorted(ranges):
+        if start != position or end < start:
+            raise BundleError(f"{path}: tensor {name!r} overlaps another tensor or leaves a gap")
+        position = end
+    if 8 + length + position > size:
+        raise BundleError(f"{path} is truncated (expected {8 + length + position} bytes, found {size})")
+    if 8 + length + position < size:
+        raise BundleError(f"{path} has {size - 8 - length - position} unexpected trailing bytes")
+    return header, metadata
+
+
+def read_safetensors_header(path: Path) -> dict[str, Any]:
+    """Tensor entries of a checked safetensors header (see :func:`read_safetensors`)."""
+    return read_safetensors(path)[0]
 
 
 # --------------------------------------------------------------------------- VAE layout
@@ -242,18 +289,7 @@ def _validate_transformer_shards(directory: Path, config: TransformerConfig) -> 
         for name in present:
             if name in tensors:
                 raise BundleError(f"tensor {name!r} appears in more than one shard")
-            entry = header[name]
-            shape = tuple(int(v) for v in entry["shape"])
-            dtype = entry["dtype"]
-            if shape != expected[name]:
-                raise BundleError(f"tensor {name!r} has shape {list(shape)}, expected {list(expected[name])}")
-            if config.is_fp32_tensor(name):
-                if dtype != "F32":
-                    raise BundleError(f"tensor {name!r} must be stored in F32 (found {dtype})")
-            elif dtype not in ("BF16", "F32"):
-                raise BundleError(f"tensor {name!r} has unsupported dtype {dtype}")
-            tensors[name] = TensorInfo(dtype, shape, path)
-            total_bytes += int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
+        total_bytes += _check_tensor_entries(header, path, expected, config, tensors)
 
     metadata = index.get("metadata")
     if isinstance(metadata, dict) and "total_size" in metadata and int(metadata["total_size"]) != total_bytes:
@@ -263,15 +299,139 @@ def _validate_transformer_shards(directory: Path, config: TransformerConfig) -> 
     return tensors
 
 
+def _check_tensor_entries(
+    header: dict[str, Any],
+    path: Path,
+    expected: dict[str, tuple[int, ...]],
+    config: TransformerConfig,
+    tensors: dict[str, TensorInfo],
+) -> int:
+    """Check shapes and storage dtypes of ``header`` and record them; returns the byte count."""
+    total = 0
+    for name in sorted(header):
+        entry = header[name]
+        if name not in expected:
+            raise BundleError(f"unexpected transformer tensor {name!r}")
+        shape = tuple(int(v) for v in entry["shape"])
+        dtype = entry["dtype"]
+        if shape != expected[name]:
+            raise BundleError(f"tensor {name!r} has shape {list(shape)}, expected {list(expected[name])}")
+        if config.is_fp32_tensor(name):
+            if dtype != "F32":
+                raise BundleError(f"tensor {name!r} must be stored in F32 (found {dtype})")
+        elif dtype not in ("BF16", "F32"):
+            raise BundleError(f"tensor {name!r} has unsupported dtype {dtype}")
+        tensors[name] = TensorInfo(dtype, shape, path)
+        total += int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
+    return total
+
+
+# --------------------------------------------------------------------------- single-file checkpoints
+
+
+def _metadata_json(metadata: dict[str, str], key: str, path: Path) -> dict[str, Any]:
+    if key not in metadata:
+        raise BundleError(f"{path}: single-file metadata lacks {key!r}")
+    try:
+        value = json.loads(metadata[key])
+    except json.JSONDecodeError as error:
+        raise BundleError(f"{path}: metadata {key!r} is not valid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise BundleError(f"{path}: metadata {key!r} must be a JSON object")
+    return value
+
+
+def inspect_single_file(path: str | os.PathLike[str]) -> BundleInfo:
+    """Validate a single-file checkpoint without reading any tensor data."""
+    path = Path(path)
+    if not path.is_file():
+        raise BundleError(f"checkpoint file not found: {path}")
+    header, metadata = read_safetensors(path)
+    found = metadata.get("format")
+    if found != SINGLE_FILE_FORMAT:
+        raise BundleError(
+            f"{path.name} is not a Kandinsky ImageSR single-file checkpoint "
+            f"(safetensors metadata format is {found!r}, expected {SINGLE_FILE_FORMAT!r})"
+        )
+    version = metadata.get("format_version")
+    if version != SINGLE_FILE_FORMAT_VERSION:
+        raise BundleError(
+            f"{path.name} uses single-file format_version {version!r}; this version of the nodes supports "
+            f"{SINGLE_FILE_FORMAT_VERSION!r}"
+        )
+    transformer_config = parse_transformer_config(_metadata_json(metadata, "transformer_config", path))
+    model_index = _metadata_json(metadata, "model_index", path)
+    validate_pipeline_config(model_index, transformer_config)
+    _check_component(model_index, "transformer", ["kandinsky_image_sr", "KandinskyImageSRBakedTransformer3DModel"])
+    _check_component(model_index, "vae", ["diffusers", "AutoencoderKL"])
+    scaling = validate_vae_config(_metadata_json(metadata, "vae_config", path))
+
+    expected = transformer_config.expected_tensor_shapes()
+    if any(name.startswith(("transformer.", "vae.")) for name in header):
+        raise BundleError(
+            f"{path.name} uses component prefixes (combined transformer + VAE file); only transformer-only "
+            "single-file checkpoints are supported"
+        )
+    _compare_names(set(header), set(expected), "single-file checkpoint")
+    tensors: dict[str, TensorInfo] = {}
+    _check_tensor_entries(header, path, expected, transformer_config, tensors)
+    return BundleInfo(path, transformer_config, scaling, tensors, None, kind="single_file")
+
+
+def inspect_checkpoint(path: str | os.PathLike[str]) -> BundleInfo:
+    """Validate a bundle directory or a single-file checkpoint."""
+    path = Path(path)
+    return inspect_single_file(path) if path.is_file() else inspect_bundle(path)
+
+
+def is_single_file_checkpoint(path: str | os.PathLike[str]) -> bool:
+    """Cheap discovery test: reads only the safetensors header of ``path``.
+
+    Files whose header is larger than a few MiB (not this format) are skipped
+    without reading it. Results are cached by path, size and modification time.
+    """
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    cached = _SINGLE_FILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = False
+    try:
+        with open(path, "rb") as handle:
+            prefix = handle.read(8)
+            if len(prefix) == 8:
+                (length,) = struct.unpack("<Q", prefix)
+                if 0 < length <= _DISCOVERY_MAX_HEADER_BYTES and 8 + length <= stat.st_size:
+                    header = json.loads(handle.read(length))
+                    metadata = header.get("__metadata__") if isinstance(header, dict) else None
+                    result = isinstance(metadata, dict) and metadata.get("format") == SINGLE_FILE_FORMAT
+    except (OSError, ValueError):
+        result = False
+    if len(_SINGLE_FILE_CACHE) > 4096:
+        _SINGLE_FILE_CACHE.clear()
+    _SINGLE_FILE_CACHE[key] = result
+    return result
+
+
+_SINGLE_FILE_CACHE: dict[tuple[str, int, int], bool] = {}
+
+
 # --------------------------------------------------------------------------- weight loading
 
 
-def load_transformer_state_dict(bundle: BundleInfo, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+def load_transformer_state_dict(
+    bundle: BundleInfo, dtype: torch.dtype, modulation_dtype: torch.dtype = torch.float32
+) -> dict[str, torch.Tensor]:
     """Read all transformer tensors to CPU.
 
-    Tensors the reference keeps in FP32 stay FP32. Every other tensor is converted
-    to ``dtype`` one at a time, so peak host memory stays close to one copy of the
-    model in its final precision.
+    The baked conditioning tables stay FP32. The FP32 modulation projections are
+    stored as ``modulation_dtype``; every other tensor is converted to ``dtype``.
+    Tensors are converted one at a time, so peak host memory stays close to one
+    copy of the model in its final precision.
     """
     from safetensors import safe_open
 
@@ -285,7 +445,12 @@ def load_transformer_state_dict(bundle: BundleInfo, dtype: torch.dtype) -> dict[
         with safe_open(str(shard), framework="pt", device="cpu") as handle:
             for name in sorted(by_shard[shard]):
                 tensor = handle.get_tensor(name)
-                target = torch.float32 if config.is_fp32_tensor(name) else dtype
+                if not config.is_fp32_tensor(name):
+                    target = dtype
+                elif name.endswith("_table"):
+                    target = torch.float32
+                else:
+                    target = modulation_dtype
                 if tensor.dtype != target:
                     tensor = tensor.to(target)
                 if not tensor.is_contiguous():

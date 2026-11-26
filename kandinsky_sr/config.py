@@ -46,6 +46,14 @@ MIN_OVERLAP = 0.05
 MAX_OVERLAP = 0.75
 
 
+#: Architecture of the FLUX.1 VAE (``vae/config.json`` of the official bundle).
+VAE_FLUX_CONFIG = {
+    "block_out_channels": [128, 256, 512, 512],
+    "layers_per_block": 2,
+    "latent_channels": 16,
+}
+
+
 class BundleError(ValueError):
     """Raised when a model bundle is missing, incomplete or unsupported."""
 
