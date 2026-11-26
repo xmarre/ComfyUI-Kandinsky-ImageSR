@@ -117,10 +117,11 @@ class TiledRestorer:
             bottom = min(top + size, g.height)
             right = min(left + size, g.width)
             tile = image[:, top:bottom, left:right, :].movedim(-1, 1)
-            # NCHW-contiguous like the reference. ComfyUI images are channels-last in
-            # memory; that layout would propagate through interpolation into the VAE,
-            # where reduced-precision convolutions select different kernels and the
-            # latents measurably diverge from the reference.
+            # NCHW-contiguous, as the official pipeline's tiles are for image file and
+            # PIL input. ComfyUI images are channels-last in memory; that layout would
+            # propagate through padding and interpolation into the VAE, where bf16
+            # convolutions select different kernels and the latents differ by a few
+            # percent.
             # ``Tensor.to(memory_format=...)`` returns views with unusual strides unchanged
             # (e.g. a permuted size-1 batch dimension), so make the copy explicit.
             tile = tile.to(device=device, dtype=torch.float32).contiguous()

@@ -104,6 +104,13 @@ def phase_reference(args) -> None:
     torch.set_grad_enabled(False)
     pipe = KandinskyImageSRPipeline.from_pretrained(args.bundle, torch_dtype=torch.bfloat16).to(device)
     image = load_image(args.image, tuple(args.size))
+    # Feed the official pipeline a PIL image, as its command line tool and demo do.
+    # Its tensor layout (and with it the bf16 VAE's numerics, by a few percent) depends
+    # on how the input arrives: PIL/path input gives NCHW tiles, while some tensor
+    # inputs give channels-last tiles. The pixels are identical either way.
+    from PIL import Image
+
+    pil_image = Image.fromarray((image[0].permute(1, 2, 0) * 255).round().to(torch.uint8).numpy())
     record = {"image": image, "runs": [], "presets": {}, "device": str(device), "torch": torch.__version__}
     for run in runs_from_args(args):
         stages = {"lq": [], "pred": [], "decoded": []}
@@ -130,7 +137,9 @@ def phase_reference(args) -> None:
         pipe._encode, pipe._decode, pipe.transformer.forward = _encode, _decode, _forward
         start = time.perf_counter()
         try:
-            output = pipe(image[0], upscale_factor=run["factor"], creativity=run["creativity"], output_type="pt").images
+            output = pipe(
+                pil_image, upscale_factor=run["factor"], creativity=run["creativity"], output_type="pt"
+            ).images
         finally:
             pipe._encode, pipe._decode, pipe.transformer.forward = encode, decode, forward
         record["runs"].append({**run, **stages, "output": output.float().cpu(), "seconds": time.perf_counter() - start})
