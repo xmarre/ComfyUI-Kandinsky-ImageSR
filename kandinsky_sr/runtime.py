@@ -434,13 +434,15 @@ def assemble_output(output: torch.Tensor, assemble, size: tuple[int, int], on_oo
 def resize_working_bytes(batch: int, grid, size: tuple[int, int], channels: int) -> int:
     """Device memory of the final resize beyond the native output (FP32 bound).
 
-    The final batch, plus for the image being resized: its contiguous NCHW copy,
-    the separable filter's intermediate and the resized result.
+    The final batch, plus the larger of: for the image being resized, its
+    contiguous NCHW copy, the separable filter's intermediate and the resized
+    result; or, with alpha, the alpha batch resized to the final size.
     """
     height, width = size
     final = batch * height * width * channels * 4
     per_image = 3 * 4 * (grid.out_height * grid.out_width + grid.out_height * width + height * width)
-    return final + per_image
+    alpha = batch * height * width * 4 if channels == 4 else 0
+    return final + max(per_image, alpha)
 
 
 def _finish_resized(

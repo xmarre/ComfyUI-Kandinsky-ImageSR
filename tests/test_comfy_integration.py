@@ -1035,5 +1035,6 @@ def test_final_resize_memory_is_budgeted_for_device_resident_outputs(env, monkey
     per_tile = runtime.estimate_tile_memory(model, model.bundled_vae()).per_tile
     output = runtime.output_buffer_bytes(3, grid)
     resize = runtime.resize_working_bytes(3, grid, (240, 360), 4) if expect_resize else 0
-    assert resize == 0 or resize == 3 * 240 * 360 * 4 * 4 + 12 * (400 * 600 + 400 * 360 + 240 * 360)
+    final = 3 * 240 * 360 * 4 * 4  # RGBA FP32 bound
+    assert resize == 0 or resize == final + max(12 * (400 * 600 + 400 * 360 + 240 * 360), 3 * 240 * 360 * 4)
     assert requested == [max(per_tile, resize) + output]

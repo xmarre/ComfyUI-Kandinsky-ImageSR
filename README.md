@@ -12,8 +12,11 @@ super-resolution and image restoration model from Kandinsky Lab.
 - Reproduces the official inference pipeline: tile geometry, bicubic
   preprocessing, FLUX VAE latent scaling, one-step flow correction and
   boundary-aware Hann blending.
-- 2x and 4x, all nine calibrated creativity levels per factor, arbitrary input
-  sizes, image batches, RGBA input.
+- Native 2x and 4x restoration with all nine calibrated creativity levels per
+  factor, arbitrary input sizes, image batches, RGBA input.
+- Optional final output scale between 1x and the native factor (for example
+  restore at 2x and return 1.2x), produced by resizing the finished
+  restoration.
 - Automatic tile batching, GPU or CPU blend accumulation, and out-of-memory
   recovery that never duplicates or drops tiles.
 
@@ -166,14 +169,60 @@ clear error if it receives another pack's model object.
 |---|---|---|---|
 | `sr_model` | – | | From the loader. |
 | `image` | – | | ComfyUI `IMAGE` (RGB or RGBA, any size, any batch). |
-| `upscale_factor` | `2x` | `2x`, `4x` | Output is exactly `width × factor` by `height × factor`. |
+| `upscale_factor` (shown as *native restoration scale*) | `2x` | `2x`, `4x` | Scale at which the model restores; sets tile geometry, cost and the meaning of creativity. Without `output_scale` the output is exactly `width × factor` by `height × factor`. |
 | `creativity` | 4 | 0–8 | Calibrated correction strength (see below). 4 is the official default. |
 | `overlap` | 0.25 | 0.05–0.75 | Fraction of each input tile shared with its neighbour. 0.25 is the official default. |
 | `tile_batch_size` | 0 | 0–64 | Tiles processed together; 0 = automatic. |
 | `accumulation_device` | `auto` | `auto`, `cpu`, `gpu` | Where the FP32 blend buffer lives. |
 | `vae` (optional) | – | | FLUX.1 VAE from Load VAE. Required for the single-file checkpoint; replaces a bundle's own VAE. |
+| `output_scale` (optional) | 0 | 0, or 1.0 to the native factor (max 4.0) | Final size relative to the input; 0 = native size. See [Output scale](#output-scale). |
 
 Output: `IMAGE`.
+
+## Output scale
+
+The model restores only at its two calibrated scales, 2x and 4x. `output_scale`
+sets the final size independently:
+
+- `0` (default): the native restoration size, exactly as without this input.
+  Workflows saved before this input existed behave identically.
+- `1.0` up to the native factor: the image is restored at the native scale, then
+  the finished, blended image is resized to
+  `round_half_up(input width × output_scale)` by
+  `round_half_up(input height × output_scale)` with antialiased bicubic
+  resampling (FP32, clamped to [0, 1]). `1.0` restores without changing the
+  size; `1.2` turns 1000×1000 into 1200×1200.
+- Values above the native factor are rejected (for example 2.5 with
+  `2x`: select the `4x` native scale); values between 0 and 1, negative and
+  non-finite values are rejected as well. Nothing is clamped silently.
+
+Dimensions are computed from the original input size, with the scale taken as
+a decimal rounded to six places (so widget float noise such as
+`1.2000000000000002` cannot change a dimension), and halves rounded up. When
+the result equals the native size (for example `output_scale` equal to the
+native factor, or a scale that rounds to it for a tiny image), no resize is
+performed. An alpha channel is resized directly from the original to the final
+size (bilinear, as on the native path); it never passes through the native
+resolution.
+
+Cost and behaviour are those of the native scale: restoring at 2x and returning
+1.2x costs exactly as much as a plain 2x restoration, and 4x restoration
+returned at 2.5x costs a full 4x restoration. Creativity keeps its native-scale
+meaning. Resizing down does not by itself improve restoration quality; it lets
+the final resolution be chosen independently of the restoration strength. Low
+creativity (0–2) at 2x followed by a modest output scale can be a good starting
+point for photographic restoration where identity and natural texture matter,
+but the best setting depends on the input.
+
+The resize runs on the device that holds the restored image (ComfyUI's
+intermediate device), one image at a time. If it runs out of GPU memory it
+finishes in system memory without repeating the restoration; if that fails as
+well, the node reports how large the output was.
+
+Direct restoration at a non-native scale (feeding the model tiles enlarged by,
+say, 1.2x instead of 2x) is not part of the node: the released model has no
+calibration for it. A research prototype and its findings are described under
+[Direct fractional restoration (research)](#direct-fractional-restoration-research).
 
 ## Creativity
 
@@ -304,9 +353,16 @@ In `example_workflows/` (drag into ComfyUI):
 - `04_Qualification_Grid.json` – 2x and 4x at creativity 0/4/8 plus bicubic
   baselines, for judging results on your own images.
 - `05_Official_Bundle.json` – the official bundle with its own VAE.
+- `06_Fractional_Restoration.json` – native 2x restoration at creativity 1,
+  returned at 1.2x the input size through `output_scale`.
+- `07_Fractional_Comparison.json` – one 2x restoration (creativity 1) saved at
+  its native size and reduced to 1.2x and 1.0x with ComfyUI's built-in Lanczos
+  resize, next to a plain bicubic 1.2x enlargement and the original. The
+  built-in resize avoids repeating the restoration; it is close to, but not
+  bit-identical with, what `output_scale` produces.
 
-Workflows 01–04 use the single-file checkpoint with `ae.safetensors` from Load
-VAE.
+Workflows 01–04, 06 and 07 use the single-file checkpoint with
+`ae.safetensors` from Load VAE.
 
 ## Testing and reference qualification
 
@@ -389,6 +445,14 @@ configured and are not qualified.
   SD1/SDXL, SD3 or FLUX.2 VAE). Select `ae.safetensors` in Load VAE.
 - **Warning "encoder/decoder ... not qualified"**: the VAE resembles FLUX.1 but
   its weights are not identical to it. Use the original `ae.safetensors`.
+- **"output_scale ... exceeds the native restoration scale"**: the output scale
+  is above the selected native factor; select `4x` for output scales above 2.
+- **"output_scale must be 0 (native size) or at least 1.0"**: values between 0
+  and 1 would shrink the image below its input size; resize afterwards with a
+  separate node if that is intended.
+- **"not enough system memory to assemble the ... output"**: the restoration
+  finished but the final image could not be built; process fewer images at once
+  or choose a smaller output scale.
 - **Out of memory with a single tile**: free VRAM, use `--lowvram`, or set
   `accumulation_device` to `cpu`.
 - **Colours differ from the official command line tool**: ComfyUI's Load Image
@@ -400,7 +464,8 @@ configured and are not qualified.
 
 - Only the published 2x/4x tile geometry and the 18 calibrated timesteps are
   supported; arbitrary strengths would require timesteps that are not baked into
-  the checkpoint.
+  the checkpoint. Other output sizes come from resizing a native restoration
+  (`output_scale`) and cost a full native restoration.
 - Quantized (FP8/INT8) and FP16 execution and `torch.compile` are not
   implemented.
 - The transformer is managed by ComfyUI's standard `ModelPatcher`, also when
