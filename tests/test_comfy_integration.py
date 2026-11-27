@@ -293,11 +293,16 @@ def test_example_workflows_reference_registered_nodes(env, path):
     widget_counts = {}
     for cls_name in ("KandinskyImageSRLoader", "KandinskyImageSRUpscale"):
         info = nodes.NODE_CLASS_MAPPINGS[cls_name].GET_NODE_INFO_V1()
-        widget_counts[cls_name] = sum(
-            1
-            for spec in info["input"]["required"].values()
-            if isinstance(spec[0], list) or spec[0] in ("INT", "FLOAT", "COMBO")
-        )
+
+        def count(section, info=info):
+            return sum(
+                1
+                for spec in info["input"].get(section, {}).values()
+                if isinstance(spec[0], list) or spec[0] in ("INT", "FLOAT", "COMBO")
+            )
+
+        # workflows saved before optional widgets existed carry only the required ones
+        widget_counts[cls_name] = {count("required"), count("required") + count("optional")}
     ours = 0
     for node in workflow["nodes"]:
         if node["type"] in ("Note", "MarkdownNote"):
@@ -305,7 +310,7 @@ def test_example_workflows_reference_registered_nodes(env, path):
         assert node["type"] in nodes.NODE_CLASS_MAPPINGS, node["type"]
         if node["type"] in widget_counts:
             ours += 1
-            assert len(node["widgets_values"]) == widget_counts[node["type"]], node
+            assert len(node["widgets_values"]) in widget_counts[node["type"]], node
     assert ours >= 2
     ids = {n["id"] for n in workflow["nodes"]}
     for link in workflow["links"]:
@@ -400,6 +405,60 @@ def test_basic_workflow_executes_through_prompt_executor(env, io_dirs):
     _execute_workflow(ROOT / "example_workflows" / "01_Basic_Upscale.json")
     saved = sorted((io_dirs / "output" / "kandinsky_sr").glob("upscale_*.png"))
     assert saved and Image.open(saved[-1]).size == (60, 48)
+
+
+def test_fractional_workflow_executes(env, io_dirs):
+    """06: 2x restoration, 1.2x output of the 30x24 example image -> 36x29 (28.8 rounds up)."""
+    from PIL import Image
+
+    wf = json.loads((ROOT / "example_workflows" / "06_Fractional_Restoration.json").read_text())
+    up = next(n for n in wf["nodes"] if n["type"] == "KandinskyImageSRUpscale")
+    assert up["widgets_values"] == ["2x", 1, 0.25, 0, "auto", 1.2]
+    _execute_workflow(ROOT / "example_workflows" / "06_Fractional_Restoration.json")
+    saved = sorted((io_dirs / "output" / "kandinsky_sr").glob("restore2x_c1_out1.2x_*.png"))
+    assert saved and Image.open(saved[-1]).size == (36, 29)
+
+
+def test_fractional_comparison_workflow_restores_once(env, io_dirs, monkeypatch):
+    from PIL import Image
+
+    runtime = env["module"]("runtime")
+    runs = []
+    real_run = runtime.TiledRestorer.run
+    monkeypatch.setattr(runtime.TiledRestorer, "run", lambda self, i, o: runs.append(1) or real_run(self, i, o))
+    _execute_workflow(ROOT / "example_workflows" / "07_Fractional_Comparison.json")
+    assert runs == [1]
+    out = io_dirs / "output" / "kandinsky_sr"
+    sizes = {
+        prefix: Image.open(sorted(out.glob(f"{prefix}_*.png"))[-1]).size
+        for prefix in (
+            "cmp_original",
+            "cmp_bicubic_out1.2x",
+            "cmp_restore2x_c1_out2x",
+            "cmp_restore2x_c1_out1.2x_lanczos",
+            "cmp_restore2x_c1_out1.0x_lanczos",
+        )
+    }
+    assert sizes == {
+        "cmp_original": (30, 24),
+        "cmp_bicubic_out1.2x": (36, 29),
+        "cmp_restore2x_c1_out2x": (60, 48),
+        "cmp_restore2x_c1_out1.2x_lanczos": (36, 29),
+        "cmp_restore2x_c1_out1.0x_lanczos": (30, 24),
+    }
+
+
+def test_api_prompt_without_output_scale_validates_and_runs(env, io_dirs):
+    """API-format prompts written before output_scale existed omit the input entirely."""
+    import execution
+
+    prompt = _api_prompt(json.loads((ROOT / "example_workflows" / "01_Basic_Upscale.json").read_text()))
+    for node in prompt.values():
+        if node["class_type"] == "KandinskyImageSRUpscale":
+            node["inputs"].pop("output_scale", None)
+            assert "output_scale" not in node["inputs"]
+    valid = asyncio.run(execution.validate_prompt("run", prompt, None))
+    assert valid[0], valid[1]
 
 
 def test_workflows_saved_with_earlier_versions_still_run(env, io_dirs):
@@ -641,3 +700,339 @@ def test_dynamic_patcher_is_opt_in_and_guarded(env):
             runtime.load_model(path, "x", weight_dtype="bf16", patcher="dynamic")
     with pytest.raises(ValueError, match="patcher"):
         runtime.load_model(path, "x", weight_dtype="bf16", patcher="other")
+
+
+# ----------------------------------------------------------------------------- output scale
+
+
+def _rgba(batch=2, h=27, w=41, seed=3):
+    """RGBA batch with opaque, transparent, gradient and hard-edged alpha."""
+    gen = torch.Generator().manual_seed(seed)
+    image = torch.rand(batch, h, w, 4, generator=gen)
+    image[0, ..., 3] = torch.linspace(0, 1, w)[None, :]  # smooth gradient
+    image[0, : h // 3, :, 3] = 0.0  # fully transparent band
+    image[0, -2:, :, 3] = 1.0  # fully opaque rows
+    if batch > 1:
+        image[1, ..., 3] = (torch.arange(w)[None, :] >= w // 2).float()  # sharp boundary
+    return image
+
+
+def _reference_resize(native_rgb, alpha, size):
+    """The documented operation applied to the native restoration (and to the original alpha)."""
+    import torch.nn.functional as F
+
+    from kandinsky_sr.resize import resize_rgb
+
+    rgb = resize_rgb(native_rgb, size)
+    if alpha is None:
+        return rgb
+    resized = F.interpolate(alpha.movedim(-1, 1).float(), size=size, mode="bilinear", align_corners=False)
+    return torch.cat([rgb, resized.clamp(0, 1).movedim(1, -1)], dim=-1)
+
+
+def _forbid_resize(env, monkeypatch):
+    runtime = env["module"]("runtime")
+
+    def fail(*args, **kwargs):
+        raise AssertionError("the native path must not resize")
+
+    monkeypatch.setattr(runtime, "resize_rgb", fail)
+    monkeypatch.setattr(runtime, "_finish_resized", fail)
+
+
+@pytest.mark.parametrize("factor,native_scale", [("2x", 2.0), ("4x", 4.0)])
+def test_native_output_scale_values_are_bitwise_unchanged_and_never_resize(env, monkeypatch, factor, native_scale):
+    model = _load(env)
+    for image in (_image(batch=2, h=33, w=47), _rgba()):
+        omitted = _run(env, model, image, upscale_factor=factor)
+        _forbid_resize(env, monkeypatch)
+        for scale in (0.0, native_scale):
+            assert torch.equal(_run(env, model, image, upscale_factor=factor, output_scale=scale), omitted)
+        monkeypatch.undo()
+
+
+def test_scale_rounding_to_the_native_size_bypasses_the_resize(env, monkeypatch):
+    model = _load(env)
+    image = _image(batch=1, h=2, w=3)  # 2 * 1.99 = 3.98 -> 4 and 3 * 1.99 = 5.97 -> 6: the native 2x size
+    native = _run(env, model, image)
+    _forbid_resize(env, monkeypatch)
+    assert torch.equal(_run(env, model, image, output_scale=1.99), native)
+
+
+@pytest.mark.parametrize(
+    "factor,scale",
+    [("2x", 1.0), ("2x", 1.2), ("2x", 1.5), ("2x", 1.75), ("4x", 2.25), ("4x", 2.5), ("4x", 3.2), ("4x", 1.0)],
+)
+def test_fractional_output_is_the_native_restoration_resized(env, factor, scale):
+    from decimal import Decimal
+
+    import comfy.model_management as mm
+
+    from kandinsky_sr.resize import target_size
+
+    model = _load(env)
+    for image in (_image(batch=2, h=33, w=47), _rgba(batch=2, h=27, w=41)):
+        native = _run(env, model, image, upscale_factor=factor).float()
+        out = _run(env, model, image, upscale_factor=factor, output_scale=scale)
+        h, w = image.shape[1:3]
+        size = target_size(h, w, Decimal(str(scale)), int(factor[0]))
+        alpha = image[..., 3:] if image.shape[-1] == 4 else None
+        expected = _reference_resize(native[..., :3], alpha, size).to(mm.intermediate_dtype())
+        assert out.shape == (image.shape[0], *size, image.shape[-1])
+        assert out.dtype == expected.dtype and out.device == native.device
+        assert torch.equal(out, expected)
+        assert torch.isfinite(out).all() and out.min() >= 0 and out.max() <= 1
+
+
+def test_alpha_is_resized_from_the_original_not_from_the_native_resolution(env):
+    import torch.nn.functional as F
+
+    model = _load(env)
+    image = _rgba(batch=2, h=27, w=41)
+    out = _run(env, model, image, output_scale=1.5)
+    direct = F.interpolate(image[..., 3:].movedim(-1, 1), size=out.shape[1:3], mode="bilinear", align_corners=False)
+    assert torch.equal(out[..., 3:], direct.clamp(0, 1).movedim(1, -1))
+    # fully transparent and fully opaque regions stay exactly so; a hard edge stays within [0, 1]
+    assert (out[0, :6, :, 3] == 0).all()
+    torch.testing.assert_close(out[0, -2:, :, 3], torch.ones_like(out[0, -2:, :, 3]), rtol=0, atol=1e-6)
+    assert out[1, ..., 3].min() == 0 and out[1, ..., 3].max() == 1
+
+
+@pytest.mark.parametrize("h,w", [(1, 1), (1, 9), (8, 1), (5, 7), (3, 64)])
+def test_tiny_and_thin_images(env, h, w):
+    from decimal import Decimal
+
+    from kandinsky_sr.resize import target_size
+
+    model = _load(env)
+    for scale in (1.0, 1.5, 1.75):
+        out = _run(env, model, _image(batch=1, h=h, w=w), output_scale=scale)
+        assert out.shape[1:3] == target_size(h, w, Decimal(str(scale)), 2) and min(out.shape[1:3]) >= 1
+
+
+@pytest.mark.parametrize("scale", [-1.0, 0.5, float("nan"), float("inf"), -float("inf"), 2.5, 4.5, "1.2", None])
+def test_invalid_output_scale_fails_before_any_model_work(env, monkeypatch, scale):
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+
+    def no_load(*args, **kwargs):
+        raise AssertionError("models were loaded before the output scale was validated")
+
+    monkeypatch.setattr(mm, "load_models_gpu", no_load)
+    monkeypatch.setattr(runtime, "resolve_vae", no_load)
+    with pytest.raises(ValueError, match="output_scale"):
+        _run(env, model, _image(), output_scale=scale)
+
+
+def test_existing_factor_validation_is_unchanged(env):
+    model = _load(env)
+    with pytest.raises(ValueError, match="upscale_factor must be one of"):
+        _run(env, model, _image(), upscale_factor="3x")
+    with pytest.raises(ValueError, match="upscale_factor must be one of"):
+        _run(env, model, _image(), upscale_factor="3x", output_scale=1.5)
+
+
+def test_native_inference_is_identical_with_and_without_output_scale(env, monkeypatch):
+    """Same tiles, batches, timestep index; the native restoration runs once per call."""
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    runs = []
+    real_run = runtime.TiledRestorer.run
+
+    def spy(self, images, opts):
+        output, stats = real_run(self, images, opts)
+        runs.append((self.grid, opts.timestep, opts.timestep_index, stats.tiles, list(stats.batch_sizes), output))
+        return output, stats
+
+    monkeypatch.setattr(runtime.TiledRestorer, "run", spy)
+    image = _image(batch=2, h=150, w=170)
+    _run(env, model, image, creativity=1)
+    _run(env, model, image, creativity=1, output_scale=1.2)
+    assert len(runs) == 2
+    (g0, t0, i0, n0, b0, out0), (g1, t1, i1, n1, b1, out1) = runs
+    assert (g0, t0, i0, n0, b0) == (g1, t1, i1, n1, b1) and t0 == 0.086 and n0 == 2 * g0.num_tiles
+    assert torch.equal(out0, out1)
+
+
+def test_runtime_signature_is_backward_compatible(env):
+    import inspect
+
+    runtime = env["module"]("runtime")
+    params = list(inspect.signature(runtime.upscale).parameters)
+    assert params == [
+        "model",
+        "image",
+        "upscale_factor",
+        "creativity",
+        "overlap",
+        "tile_batch_size",
+        "accumulation_device",
+        "vae",
+        "output_scale",
+    ]
+    assert inspect.signature(runtime.upscale).parameters["output_scale"].default == 0.0
+    model = _load(env)
+    image = _image()
+    positional, stats = runtime.upscale(model, image, 2, 4, 0.25, 0, "auto", None)
+    assert positional.shape[1:3] == (80, 112) and stats.output_size == (80, 112)
+    _, stats = runtime.upscale(model, image, 2, 4, 0.25, 0, "auto", None, 1.2)
+    assert stats.output_size == (48, 67)  # 40 * 1.2 = 48, 56 * 1.2 = 67.2
+
+
+def test_repeated_runs_with_different_scales_keep_no_state(env):
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    image = _image(batch=1, h=31, w=45)
+    first = _run(env, model, image)
+    seen = []
+    for scale in (1.2, 1.5, 0.0, 1.0, 2.0, 1.2):
+        out = _run(env, model, image, output_scale=scale)
+        seen.append(tuple(out.shape[1:3]))
+        if scale in (0.0, 2.0):
+            assert torch.equal(out, first)
+    assert seen == [(37, 54), (47, 68), (62, 90), (31, 45), (62, 90), (37, 54)]
+    assert not any(isinstance(v, torch.Tensor) and v.ndim == 4 for v in vars(model).values())
+    del mm, runtime
+
+
+def test_native_resolution_output_is_released_after_resizing(env, monkeypatch):
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    refs = []
+    real_run = runtime.TiledRestorer.run
+
+    def spy(self, images, opts):
+        output, stats = real_run(self, images, opts)
+        refs.append(weakref.ref(output))
+        return output, stats
+
+    monkeypatch.setattr(runtime.TiledRestorer, "run", spy)
+    out = _run(env, model, _image(batch=2, h=60, w=70), output_scale=1.3)
+    gc.collect()
+    assert refs and refs[0]() is None and out.shape[1:3] == (78, 91)
+
+
+def test_cancellation_before_the_final_resize(env, monkeypatch):
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    real_run = runtime.TiledRestorer.run
+    resized = []
+
+    def run_then_cancel(self, images, opts):
+        result = real_run(self, images, opts)
+        mm.interrupt_current_processing(True)
+        return result
+
+    monkeypatch.setattr(runtime.TiledRestorer, "run", run_then_cancel)
+    monkeypatch.setattr(runtime, "resize_rgb", lambda *a: resized.append(1))
+    try:
+        with pytest.raises(mm.InterruptProcessingException):
+            _run(env, model, _image(), output_scale=1.5)
+    finally:
+        mm.interrupt_current_processing(False)
+    assert not resized
+
+
+class _OnDevice:
+    """Stands in for a restored output on an accelerator: ``.cpu()`` yields the real tensor."""
+
+    device = torch.device("cuda", 0)
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self.shape = tensor.shape
+
+    def cpu(self):
+        return self.tensor
+
+
+def test_assembly_oom_on_the_device_finishes_in_system_memory_without_rerunning(env):
+    runtime = env["module"]("runtime")
+    native = torch.rand(2, 10, 12, 3)
+    calls, freed = [], []
+
+    def assemble(output):
+        calls.append(output.device.type)
+        if output.device.type != "cpu":
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory (resize)")
+        return output * 2
+
+    out = runtime.assemble_output(_OnDevice(native), assemble, (10, 12), on_oom=lambda: freed.append(1))
+    assert calls == ["cuda", "cpu"] and freed == [1] and torch.equal(out, native * 2)
+
+
+def test_assembly_errors_other_than_oom_are_not_retried(env):
+    runtime = env["module"]("runtime")
+    calls = []
+
+    def assemble(output):
+        calls.append(1)
+        raise RuntimeError("shape mismatch")
+
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        runtime.assemble_output(_OnDevice(torch.zeros(1, 2, 2, 3)), assemble, (2, 2))
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("on_device", [True, False])
+def test_assembly_oom_in_system_memory_raises_an_actionable_error(env, on_device):
+    runtime = env["module"]("runtime")
+    native = torch.zeros(3, 4, 5, 3)
+
+    def assemble(output):
+        raise torch.cuda.OutOfMemoryError("out of memory")
+
+    with pytest.raises(runtime.OutputAssemblyError, match=r"assemble the 7x6 output of 3 image\(s\)"):
+        runtime.assemble_output(_OnDevice(native) if on_device else native, assemble, (6, 7))
+
+
+def test_final_resize_out_of_memory_in_the_node_does_not_rerun_the_restoration(env, monkeypatch):
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    runs = []
+    real_run = runtime.TiledRestorer.run
+    monkeypatch.setattr(runtime.TiledRestorer, "run", lambda self, i, o: runs.append(1) or real_run(self, i, o))
+
+    def oom(*args):
+        raise torch.cuda.OutOfMemoryError("out of memory (resize)")
+
+    monkeypatch.setattr(runtime, "resize_rgb", oom)
+    with pytest.raises(runtime.OutputAssemblyError):
+        _run(env, model, _image(), output_scale=1.5)  # CPU output: no further fallback exists
+    assert runs == [1]
+
+
+@pytest.mark.parametrize("scale,expect_resize", [(0.0, False), (1.2, True)])
+def test_final_resize_memory_is_budgeted_for_device_resident_outputs(env, monkeypatch, scale, expect_resize):
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    gpu = torch.device("cuda", 0)
+    requested = []
+
+    class Planned(Exception):
+        pass
+
+    def plan(models, memory_required=0, **kwargs):
+        requested.append(memory_required)
+        raise Planned
+
+    monkeypatch.setattr(model.patcher, "load_device", gpu)
+    monkeypatch.setattr(mm, "intermediate_device", lambda: gpu)
+    monkeypatch.setattr(mm, "load_models_gpu", plan)
+    image = _rgba(batch=3, h=200, w=300)
+    with pytest.raises(Planned):
+        runtime.upscale(model, image, 2, 4, tile_batch_size=1, accumulation_device="cpu", output_scale=scale)
+    grid = runtime.make_grid(200, 300, 2, model.config.tile_size, 0.25)
+    per_tile = runtime.estimate_tile_memory(model, model.bundled_vae()).per_tile
+    output = runtime.output_buffer_bytes(3, grid)
+    resize = runtime.resize_working_bytes(3, grid, (240, 360), 4) if expect_resize else 0
+    assert resize == 0 or resize == 3 * 240 * 360 * 4 * 4 + 12 * (400 * 600 + 400 * 360 + 240 * 360)
+    assert requested == [max(per_tile, resize) + output]

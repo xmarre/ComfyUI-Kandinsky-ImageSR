@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -373,18 +374,7 @@ def upscale(
         def assemble(native: torch.Tensor) -> torch.Tensor:
             return _finish_output(native, alpha, grid, out_dtype)
 
-    out_of_memory = False
-    try:
-        return assemble(output), stats
-    except Exception as error:
-        if not is_oom(error) or output.device.type == "cpu":
-            raise
-        out_of_memory = True
-    if out_of_memory:  # outside the except block, so the failed attempt's tensors are released
-        logger.warning("Kandinsky ImageSR: out of memory while assembling the output; finishing in system memory")
-        mm.soft_empty_cache()
-        output = output.cpu()
-    return assemble(output), stats
+    return assemble_output(output, assemble, final_size, on_oom=mm.soft_empty_cache), stats
 
 
 def _same_device(a: torch.device, b: torch.device) -> bool:
@@ -400,6 +390,45 @@ def _same_device(a: torch.device, b: torch.device) -> bool:
 def output_buffer_bytes(batch: int, grid) -> int:
     """FP32 RGB output batch."""
     return batch * grid.out_height * grid.out_width * 3 * 4
+
+
+class OutputAssemblyError(RuntimeError):
+    """The restored image could not be assembled into the final output (out of memory)."""
+
+
+def assemble_output(output: torch.Tensor, assemble, size: tuple[int, int], on_oom=None) -> torch.Tensor:
+    """``assemble(output)``; on out-of-memory on an accelerator, again in system memory.
+
+    The native restoration is never rerun: only the assembly step (alpha, final
+    resize, dtype conversion) is retried, from the already restored ``output``.
+    Errors other than out-of-memory propagate unchanged.
+    """
+    failure = None
+    try:
+        return assemble(output)
+    except Exception as error:
+        if not is_oom(error):
+            raise
+        traceback.clear_frames(error.__traceback__)
+        failure = error if output.device.type == "cpu" else None
+    if failure is None:  # outside the except block, so the failed attempt's tensors are released
+        logger.warning("Kandinsky ImageSR: out of memory while assembling the output; finishing in system memory")
+        if on_oom is not None:
+            on_oom()
+        output = output.cpu()
+        try:
+            return assemble(output)
+        except Exception as error:
+            if not is_oom(error):
+                raise
+            traceback.clear_frames(error.__traceback__)
+            failure = error
+    height, width = size
+    raise OutputAssemblyError(
+        f"Kandinsky ImageSR: the restoration finished, but there is not enough system memory to assemble the "
+        f"{width}x{height} output of {output.shape[0]} image(s). Free system memory, process fewer images at once, "
+        "or choose a smaller output_scale."
+    ) from failure
 
 
 def resize_working_bytes(batch: int, grid, size: tuple[int, int], channels: int) -> int:
