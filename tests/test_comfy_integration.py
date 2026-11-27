@@ -777,7 +777,8 @@ def test_fractional_output_is_the_native_restoration_resized(env, factor, scale)
         h, w = image.shape[1:3]
         size = target_size(h, w, Decimal(str(scale)), int(factor[0]))
         alpha = image[..., 3:] if image.shape[-1] == 4 else None
-        expected = _reference_resize(native[..., :3], alpha, size).to(mm.intermediate_dtype())
+        out_dtype = mm.intermediate_dtype() if hasattr(mm, "intermediate_dtype") else torch.float32
+        expected = _reference_resize(native[..., :3], alpha, size).to(out_dtype)
         assert out.shape == (image.shape[0], *size, image.shape[-1])
         assert out.dtype == expected.dtype and out.device == native.device
         assert torch.equal(out, expected)
