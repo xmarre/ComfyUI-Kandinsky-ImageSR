@@ -385,8 +385,15 @@ as skipped). The suite includes:
 - out-of-memory injection in every stage and during accumulator allocation,
   verifying identical output after retries;
 - node registration, schema, example workflow validation with ComfyUI's
-  prompt validator, and execution of a workflow through ComfyUI's
-  `PromptExecutor` on a small synthetic bundle.
+  prompt validator, and execution of workflows through ComfyUI's
+  `PromptExecutor` on small synthetic checkpoints, including workflows saved
+  before the latest inputs existed;
+- output scale: validation, exact target dimensions and rounding, equality with
+  the native restoration followed by the documented resize (RGB, RGBA,
+  batches, tiny images), bit-identical native results when no resize applies,
+  out-of-memory fallback without repeating the restoration, cancellation and
+  memory budgeting;
+- geometry of the direct fractional research prototype.
 
 `scripts/verify_reference.py` compares this implementation with the official
 pipeline on the real checkpoint, stage by stage (encoded latents, transformer
@@ -428,6 +435,80 @@ scores in bf16 unless asked to upcast; this package requests FP32 score
 precision, which brings those backends to within 0.25 % of SDPA (from 2–3 %).
 Backends with their own quantization (e.g. SageAttention) are used as
 configured and are not qualified.
+
+## Direct fractional restoration (research)
+
+`output_scale` always restores at a calibrated native scale. A faster
+alternative would be to restore directly at the requested scale: enlarge the
+input by, say, 1.2x instead of 2x, so each 1024-pixel tile covers more of the
+input and fewer transformer evaluations are needed. This is **not** offered by
+the node. `scripts/research_direct_fractional.py` is an isolated prototype for
+studying it.
+
+**What the model receives.** The transformer sees only the VAE latent of the
+bicubic-enlarged tile and one of its baked timesteps. There is no scale or
+degradation input; the two calibrated tables (2x: 0.07–0.30, 4x: 0.17–0.38) do
+not share any timestep, so the scale is implied only by the choice of timestep
+and by how blurred the enlarged input looks. A 1.2x enlargement is much sharper
+than a 2x one, so its latent lies outside what the 2x calibration was made for,
+and the correction `z − t·v` with a 2x timestep is applied to an input that
+needs less of it. The prototype reuses the 2x creativity timesteps for scales
+between 1x and 2x; no calibration exists for this.
+
+**Geometry.** Tiles are placed in output pixels with the official rule
+(1024-pixel tiles, stride `int(1024 × (1 − overlap))`, last tile aligned to the
+edge, boundary-aware Hann windows); every output pixel centre `o` maps to the
+input coordinate `(o + 0.5) × in / out − 0.5`, and each tile is sampled from
+the whole image (bicubic, border taps clamped), so overlapping tiles share one
+global mapping. Tests establish positive blend weight for every pixel,
+equality with the native tile placement at 2x, seam-free reconstruction with an
+identity model, and bit-identical delegation to the native pipeline at exact
+2x/4x.
+
+**Experiment** (CPU, bf16, single-file checkpoint and `ae.safetensors`): a
+420×1260 reference (a public-domain portrait, a synthetic text and pattern
+chart, a CC0 photograph) was reduced by each scale with antialiased bicubic
+resampling and JPEG-compressed (quality 75); each method then produced the
+reference size. PSNR / SSIM on luma against the reference, creativity 1
+(t = 0.086):
+
+| Scale | Bicubic | Native 2x + resize | Direct | Tiles native / direct |
+|---|---|---|---|---|
+| 1.0 | 30.92 / 0.963 | 28.41 / 0.951 | 24.32 / 0.880 | 3 / 2 |
+| 1.2 | 24.44 / 0.925 | 25.90 / 0.926 | 24.70 / 0.887 | 3 / 2 |
+| 1.5 | 22.41 / 0.881 | 24.09 / 0.889 | 23.87 / 0.872 | 2 / 2 |
+| 1.75 | 21.30 / 0.850 | 23.05 / 0.867 | 22.89 / 0.855 | 2 / 2 |
+| 2.0 | 20.38 / 0.815 | 20.90 / 0.827 | (= native) | 2 / 2 |
+
+At creativity 0, 2 and 4 the ordering is the same at every scale, and the
+direct path loses more as creativity rises (at 1.2x: SSIM 0.896 / 0.865 / 0.847
+direct versus 0.929 / 0.920 / 0.913 native). Visually, direct restoration
+over-sharpens faces and raises contrast, and it invents glyph shapes in small
+text ("Restoration" rendered as "Raslorallon", "13px" as "18px") where native
+2x + resize stays faithful. At 1.0x neither restoration beats the JPEG input in
+PSNR: the restoration changes pixels in ways PSNR penalises. No step
+discontinuities were found at the tile window boundaries.
+
+**Cost.** With the implemented placement, a 2048² input needs 9 transformer
+evaluations directly at 1.0x or 1.2x, 16 at 1.5x and 25 at 1.75x, against 25 for
+native 2x (1024²: 1, 4, 4, 4 against 9). The saving disappears towards 2x
+because tile counts are quantised. Per-tile cost is the same, so time scales
+with the tile count; this has not been measured on a GPU.
+
+**Conclusion.** On this evidence direct fractional restoration is faster but
+clearly less faithful, so the node keeps the native restoration followed by a
+resize. The prototype remains available for experiments on other images or
+with other timestep choices (`--timestep-table 4` reuses the 4x values):
+
+```bash
+python scripts/research_direct_fractional.py tiles --sizes 1024 2048
+python scripts/research_direct_fractional.py experiment --comfyui /path/to/ComfyUI \
+    --model models/diffusion_models/kandinsky_imagesr_2.0.safetensors --vae models/vae/ae.safetensors \
+    --images reference.png --scales 1.0 1.2 1.5 1.75 2.0 --creativity 0 1 2 4 --jpeg 75 --out results/
+```
+
+The reference image's dimensions must be reachable from an integer size at
+every scale (420 works for 1.0/1.2/1.5/1.75/2.0).
 
 ## Troubleshooting
 

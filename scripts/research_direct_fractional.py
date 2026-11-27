@@ -46,8 +46,11 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Appended, not prepended: the repository root must not shadow ComfyUI's own modules
+# (this package has a top-level ``nodes.py`` too).
+for _path in (str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parents[1])):
+    if _path not in sys.path:
+        sys.path.append(_path)
 
 from kandinsky_sr.pipeline import RunOptions, TiledRestorer  # noqa: E402
 from kandinsky_sr.resize import scaled_length  # noqa: E402
