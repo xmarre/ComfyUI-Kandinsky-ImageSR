@@ -23,6 +23,7 @@ from .memory import (
 )
 from .model import KandinskyImageSRTransformer, build_rope, comfy_attention, comfy_operations
 from .pipeline import RunOptions, RunStats, TiledRestorer
+from .resize import resize_rgb, target_size, validate_output_scale
 from .tiling import make_grid
 from .vae import ImageSRVAE, validate_imagesr_vae
 
@@ -248,11 +249,16 @@ def upscale(
     tile_batch_size: int = 0,
     accumulation_device: str = "auto",
     vae: object | None = None,
+    output_scale: float = 0.0,
 ) -> tuple[torch.Tensor, RunStats]:
     """Super-resolve a ComfyUI IMAGE batch. ``tile_batch_size=0`` selects automatically.
 
     ``vae`` is a FLUX.1 ``comfy.sd.VAE`` (e.g. from Load VAE); without it the
-    official bundle's own VAE is used.
+    official bundle's own VAE is used. ``upscale_factor`` is the native
+    restoration scale (2 or 4). ``output_scale`` 0 returns the native size;
+    otherwise the restored image is resized to ``round_half_up(input *
+    output_scale)`` (see :mod:`.resize`), with ``1 <= output_scale <=
+    upscale_factor``.
     """
     import comfy.model_management as mm
     import comfy.utils
@@ -260,6 +266,7 @@ def upscale(
     validate_image(image)
     timestep = cfg.resolve_timestep(upscale_factor, creativity)
     index = model.config.timestep_index(timestep)
+    scale = validate_output_scale(output_scale, upscale_factor)
     if isinstance(tile_batch_size, bool) or not isinstance(tile_batch_size, int) or tile_batch_size < 0:
         raise ValueError(f"tile_batch_size must be 0 (auto) or a positive integer, got {tile_batch_size!r}")
     if accumulation_device not in ACCUMULATION_MODES:
@@ -270,6 +277,9 @@ def upscale(
     rgb = image[..., :3]
     grid = make_grid(height, width, upscale_factor, model.config.tile_size, overlap)
     total_tiles = batch * grid.num_tiles
+    final_size = target_size(height, width, scale, upscale_factor)
+    # Exactly the native size (also when a fractional scale rounds to it): no resize at all.
+    resize = final_size != (grid.out_height, grid.out_width)
 
     vae = resolve_vae(model, vae)
     estimate = estimate_tile_memory(model, vae)
@@ -285,11 +295,15 @@ def upscale(
     # (on the GPU with --gpu-only), next to the tile working memory.
     on_device = device.type != "cpu" and _same_device(intermediate, device)
     output_bytes = output_buffer_bytes(batch, grid) if on_device else 0
+    # The final resize runs after the tile working memory is released, next to the
+    # native output: reserve whichever phase needs more.
+    resize_bytes = resize_working_bytes(batch, grid, final_size, channels) if on_device and resize else 0
 
     # Reserve working memory only for tiles that can actually run in one batch.
     requested = min(tile_batch_size, total_tiles) if tile_batch_size > 0 else 1
     gpu_acc = live_accumulator_bytes(requested) if accumulation_device == "gpu" else 0
-    mm.load_models_gpu([model.patcher, vae.patcher], memory_required=requested * per_tile + gpu_acc + output_bytes)
+    working = max(requested * per_tile + gpu_acc, resize_bytes)
+    mm.load_models_gpu([model.patcher, vae.patcher], memory_required=working + output_bytes)
 
     reserved = mm.extra_reserved_memory() if hasattr(mm, "extra_reserved_memory") else 0
     free = mm.get_free_memory(device) - output_bytes if device.type != "cpu" else 0
@@ -303,18 +317,25 @@ def upscale(
     acc_device = choose_accumulation_device(
         accumulation_device, device, live_accumulator_bytes(batch_size), free - reserved - batch_size * per_tile
     )
+    if resize:
+        final = f"final output {final_size[1]}x{final_size[0]} ({scale.normalize()}x, antialiased bicubic resize)"
+    else:
+        final = "final output at native size"
     logger.info(
-        "Kandinsky ImageSR: %d image(s) %dx%d -> %dx%d, %d tiles (%dx%d grid), t=%s, tile batch %d "
-        "(~%s per tile), accumulator %s on %s",
+        "Kandinsky ImageSR: %d image(s) %dx%d -> %dx%d native restoration (%dx, creativity %d, t=%s), %s; "
+        "%d tiles (%dx%d grid), tile batch %d (~%s per tile), accumulator %s on %s",
         batch,
         width,
         height,
         grid.out_width,
         grid.out_height,
+        upscale_factor,
+        creativity,
+        timestep,
+        final,
         total_tiles,
         grid.cols,
         grid.rows,
-        timestep,
         batch_size,
         format_bytes(per_tile),
         format_bytes(acc_bytes),
@@ -340,9 +361,21 @@ def upscale(
         del rope
 
     out_dtype = mm.intermediate_dtype() if hasattr(mm, "intermediate_dtype") else torch.float32
+    stats.output_size = final_size
+    if resize:
+        mm.throw_exception_if_processing_interrupted()
+
+        def assemble(native: torch.Tensor) -> torch.Tensor:
+            return _finish_resized(native, alpha, final_size, out_dtype, mm.throw_exception_if_processing_interrupted)
+
+    else:
+
+        def assemble(native: torch.Tensor) -> torch.Tensor:
+            return _finish_output(native, alpha, grid, out_dtype)
+
     out_of_memory = False
     try:
-        return _finish_output(output, alpha, grid, out_dtype), stats
+        return assemble(output), stats
     except Exception as error:
         if not is_oom(error) or output.device.type == "cpu":
             raise
@@ -351,7 +384,7 @@ def upscale(
         logger.warning("Kandinsky ImageSR: out of memory while assembling the output; finishing in system memory")
         mm.soft_empty_cache()
         output = output.cpu()
-    return _finish_output(output, alpha, grid, out_dtype), stats
+    return assemble(output), stats
 
 
 def _same_device(a: torch.device, b: torch.device) -> bool:
@@ -367,6 +400,42 @@ def _same_device(a: torch.device, b: torch.device) -> bool:
 def output_buffer_bytes(batch: int, grid) -> int:
     """FP32 RGB output batch."""
     return batch * grid.out_height * grid.out_width * 3 * 4
+
+
+def resize_working_bytes(batch: int, grid, size: tuple[int, int], channels: int) -> int:
+    """Device memory of the final resize beyond the native output (FP32 bound).
+
+    The final batch, plus for the image being resized: its contiguous NCHW copy,
+    the separable filter's intermediate and the resized result.
+    """
+    height, width = size
+    final = batch * height * width * channels * 4
+    per_image = 3 * 4 * (grid.out_height * grid.out_width + grid.out_height * width + height * width)
+    return final + per_image
+
+
+def _finish_resized(
+    output: torch.Tensor,
+    alpha: torch.Tensor | None,
+    size: tuple[int, int],
+    out_dtype: torch.dtype,
+    interrupt,
+) -> torch.Tensor:
+    """Resize the native RGB output to ``size`` one image at a time and append alpha.
+
+    Alpha is resized directly from the original image to ``size`` (bilinear, as
+    on the native path); it never passes through the native resolution.
+    """
+    channels = 3 if alpha is None else 4
+    final = torch.empty(output.shape[0], *size, channels, dtype=out_dtype, device=output.device)
+    for index in range(output.shape[0]):
+        interrupt()
+        final[index, ..., :3].copy_(resize_rgb(output[index : index + 1], size)[0])
+    if alpha is not None:
+        resized = F.interpolate(alpha.movedim(-1, 1).float(), size=size, mode="bilinear", align_corners=False)
+        final[..., 3:].copy_(resized.clamp_(0.0, 1.0).movedim(1, -1))
+        del resized
+    return final
 
 
 def _finish_output(output: torch.Tensor, alpha: torch.Tensor | None, grid, out_dtype: torch.dtype) -> torch.Tensor:

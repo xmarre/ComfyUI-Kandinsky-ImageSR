@@ -140,7 +140,16 @@ def test_node_registration_and_schema(env):
     ]
     # accepts the legacy type name so saved links stay valid
     assert req["sr_model"][0] == "KANDINSKY_IMAGESR_MODEL,KANDINSKY_SR_MODEL" and req["image"][0] == "IMAGE"
-    assert list(up["input"]["optional"]) == ["vae"] and up["input"]["optional"]["vae"][0] == "VAE"
+    optional = up["input"]["optional"]
+    assert list(optional) == ["vae", "output_scale"] and optional["vae"][0] == "VAE"
+    # new widget: optional, appended after the existing widgets, default = native size
+    assert optional["output_scale"][0] == "FLOAT"
+    assert {k: optional["output_scale"][1][k] for k in ("default", "min", "max", "step")} == {
+        "default": 0.0,
+        "min": 0.0,
+        "max": 4.0,
+        "step": 0.01,
+    }
     assert _options(req["upscale_factor"]) == ["2x", "4x"] and req["upscale_factor"][1]["default"] == "2x"
     assert req["creativity"][1] == {**req["creativity"][1], "default": 4, "min": 0, "max": 8}
     assert req["overlap"][1]["default"] == 0.25
@@ -323,7 +332,12 @@ def _api_prompt(workflow):
                 link = linked[name]
                 inputs[name] = [str(link[1]), link[2]]
             elif isinstance(input_spec[0], list) or input_spec[0] in ("INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"):
-                inputs[name] = next(values)
+                # widgets added after a workflow was saved keep their default, as in the frontend
+                default = input_spec[1].get("default") if len(input_spec) > 1 else None
+                value = next(values, default)
+                if value is None:
+                    raise AssertionError(f"workflow lacks a value for widget {name!r} of {node['type']}")
+                inputs[name] = value
         prompt[str(node["id"])] = {"class_type": node["type"], "inputs": inputs}
     return prompt
 

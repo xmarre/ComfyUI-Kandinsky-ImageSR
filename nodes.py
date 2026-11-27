@@ -147,8 +147,9 @@ class KandinskyImageSRUpscale(io.ComfyNode):
             category=CATEGORY,
             description=(
                 "One-step generative super-resolution and restoration with Kandinsky ImageSR 2.0. The image is "
-                "processed in fixed 1024x1024 output tiles (one transformer evaluation per tile) blended with "
-                "boundary-aware Hann windows; the output is exactly input size times the upscale factor."
+                "restored at the native 2x or 4x scale in fixed 1024x1024 output tiles (one transformer evaluation "
+                "per tile) blended with boundary-aware Hann windows. By default the output is exactly input size "
+                "times the native scale; output_scale optionally resizes the finished restoration to another size."
             ),
             search_aliases=["kandinsky", "imagesr", "super resolution", "upscale", "restore"],
             inputs=[
@@ -158,7 +159,12 @@ class KandinskyImageSRUpscale(io.ComfyNode):
                     "upscale_factor",
                     options=list(FACTOR_OPTIONS),
                     default="2x",
-                    tooltip="Output scale. Tiles are 512 px (2x) or 256 px (4x) of the input, 1024 px of the output.",
+                    display_name="native restoration scale",
+                    tooltip=(
+                        "Scale at which the model restores the image: one of its two calibrated factors. It sets the "
+                        "tile geometry (512 px input tiles at 2x, 256 px at 4x, 1024 px output tiles), the cost, and "
+                        "the meaning of creativity. The output has this scale unless output_scale is set."
+                    ),
                 ),
                 io.Int.Input(
                     "creativity",
@@ -213,6 +219,21 @@ class KandinskyImageSRUpscale(io.ComfyNode):
                         "is used as is and not modified."
                     ),
                 ),
+                io.Float.Input(
+                    "output_scale",
+                    default=0.0,
+                    min=0.0,
+                    max=4.0,
+                    step=0.01,
+                    optional=True,
+                    tooltip=(
+                        "Final size relative to the input. 0 = native restoration size. Otherwise 1.0 up to the "
+                        "native restoration scale (e.g. 1.0 = restore without enlarging, 1.2 = 1.2x): the image is "
+                        "restored at the native scale and the finished result is resized with antialiased bicubic "
+                        "resampling to round(input size x output_scale). Restoration cost and creativity behaviour "
+                        "are those of the native scale. Values above 2 require the 4x native scale."
+                    ),
+                ),
             ],
             outputs=[io.Image.Output()],
         )
@@ -228,6 +249,7 @@ class KandinskyImageSRUpscale(io.ComfyNode):
         tile_batch_size: int,
         accumulation_device: str,
         vae=None,
+        output_scale: float = 0.0,
     ) -> io.NodeOutput:
         if not isinstance(sr_model, KandinskySRModel):
             origin = type(sr_model).__module__
@@ -247,6 +269,7 @@ class KandinskyImageSRUpscale(io.ComfyNode):
             tile_batch_size=int(tile_batch_size),
             accumulation_device=accumulation_device,
             vae=vae,
+            output_scale=output_scale,
         )
         return io.NodeOutput(output)
 

@@ -77,6 +77,8 @@ class RunStats:
     oom_retries: int = 0
     final_batch_size: int = 0
     batch_sizes: list[int] = field(default_factory=list)
+    #: Final ``(height, width)`` returned to the caller (set by the runtime).
+    output_size: tuple[int, int] | None = None
 
 
 class _Accumulator:
