@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from kandinsky_sr import pipeline as pl
-from kandinsky_sr.direct import DirectGrid, DirectRestorer, cubic_sampling_matrix, plan_grid, sample_tiles
+from kandinsky_sr.direct import DirectGrid, DirectRestorer, cubic_taps, plan_grid, sample_tiles
 from kandinsky_sr.pipeline import TiledRestorer
 from kandinsky_sr.resize import scaled_length
 from kandinsky_sr.tiling import TileGrid, make_grid
@@ -108,11 +108,20 @@ def test_large_example_has_the_requested_size_and_no_native_resolution_buffers()
 # ----------------------------------------------------------------------------- sampling
 
 
-def test_sampling_matrix_rows_are_partitions_of_unity_with_four_taps():
+def test_cubic_taps_are_partitions_of_unity_clamped_to_the_image():
     coords = torch.linspace(-0.4, 40.3, 500, dtype=torch.float64)
-    matrix, first = cubic_sampling_matrix(coords, 41)
-    torch.testing.assert_close(matrix.sum(dim=1), torch.ones(500, dtype=torch.float64))
-    assert first == 0 and matrix.shape[1] <= 41 and int((matrix != 0).sum(dim=1).max()) <= 4
+    taps, weights = cubic_taps(coords, 41)
+    torch.testing.assert_close(weights.sum(dim=1), torch.ones(500, dtype=torch.float64))
+    assert taps.min() == 0 and taps.max() == 40 and taps.shape == (500, 4)
+
+
+def test_overlapping_tiles_sample_identical_values_bitwise():
+    images = _images(1, 150, 170)
+    grid = DirectGrid(150, 170, 195, 221, 0.5, tile_size=TILE)
+    a = sample_tiles(images, [(0, 0, 0)], grid, torch.device("cpu"))[0]
+    b = sample_tiles(images, [(0, 0, 1)], grid, torch.device("cpu"))[0]
+    shift = grid.lefts[1]
+    assert shift < TILE and torch.equal(a[:, :, shift:], b[:, :, : TILE - shift])
 
 
 @pytest.mark.parametrize(

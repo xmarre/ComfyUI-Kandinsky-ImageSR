@@ -15,10 +15,10 @@ Geometry (output pixels):
 * 1024-pixel tiles at ``tile_positions(max(out, 1024), 1024, int(1024 * (1 -
   overlap)))`` -- the official tiling rule applied in output space -- with the
   native boundary-aware Hann windows and separable normalisation;
-* each tile is a separable bicubic sample (PyTorch's ``A = -0.75`` kernel, taps
-  clamped to the image, i.e. replicate padding) of a bounded crop of the input
-  that covers the tile's support, so the whole image is never transferred or
-  converted per tile, and overlapping tiles see identical samples.
+* each tile is a separable four-tap bicubic sample (PyTorch's ``A = -0.75``
+  kernel, taps clamped to the image, i.e. replicate padding) of a bounded crop of
+  the input that covers the tile's support, so the whole image is never
+  transferred or converted per tile, and overlapping tiles see identical samples.
 
 When the requested size is exactly the calibration family's native size the
 native :class:`~.tiling.TileGrid` is used instead (see :func:`plan_grid`).
@@ -131,10 +131,10 @@ class DirectGrid:
         return (o + 0.5) * (in_length / out_length) - 0.5
 
     def sample_bytes(self) -> int:
-        """Per-tile sampling buffers (FP32): the largest source crop and both weight matrices."""
+        """Per-tile sampling buffers (FP32), upper bound: source crop, row pass, tile and gathered operands."""
         crop_h = min(self.height, math.ceil(self.tile_size * self.height / self.out_height) + 5)
         crop_w = min(self.width, math.ceil(self.tile_size * self.width / self.out_width) + 5)
-        return 4 * (3 * crop_h * crop_w + self.tile_size * (crop_h + crop_w))
+        return 4 * 3 * (crop_h * crop_w + 2 * self.tile_size * crop_w + 2 * self.tile_size * self.tile_size)
 
 
 def plan_grid(height: int, width: int, out_size: tuple[int, int], family: int, tile_size: int, overlap: float):
@@ -146,17 +146,16 @@ def plan_grid(height: int, width: int, out_size: tuple[int, int], family: int, t
     return grid
 
 
-def cubic_sampling_matrix(coords: torch.Tensor, length: int) -> tuple[torch.Tensor, int]:
-    """Bicubic interpolation matrix ``(len(coords), span)`` and the first source index it covers.
+def cubic_taps(coords: torch.Tensor, length: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Source indices ``(n, 4)`` and weights ``(n, 4)`` (float64) of bicubic sampling at ``coords``.
 
-    Row ``i`` holds the four ``A = -0.75`` weights of source coordinate
-    ``coords[i]``; taps outside ``[0, length)`` are clamped to the border, as in
-    ``F.interpolate(mode="bicubic")``. Weights are computed in float64.
+    PyTorch's ``A = -0.75`` kernel; taps outside ``[0, length)`` are clamped to
+    the border, as in ``F.interpolate(mode="bicubic")``.
     """
     floor = torch.floor(coords)
     t = coords - floor
     a = CUBIC_A
-    w = torch.stack(
+    weights = torch.stack(
         [
             ((a * (t + 1) - 5 * a) * (t + 1) + 8 * a) * (t + 1) - 4 * a,
             ((a + 2) * t - (a + 3)) * t * t + 1,
@@ -166,30 +165,36 @@ def cubic_sampling_matrix(coords: torch.Tensor, length: int) -> tuple[torch.Tens
         dim=1,
     )
     taps = (floor.long()[:, None] + torch.arange(-1, 3)[None, :]).clamp_(0, length - 1)
-    first = int(taps.min())
-    span = int(taps.max()) - first + 1
-    matrix = torch.zeros(len(coords), span, dtype=torch.float64)
-    matrix.scatter_add_(1, taps - first, w)
-    return matrix, first
+    return taps, weights
 
 
 def sample_tiles(images: torch.Tensor, units, grid: DirectGrid, device: torch.device) -> torch.Tensor:
     """Model-space tiles ``(N, 3, T, T)`` FP32 on ``device`` for BHWC ``images`` in [0, 1].
 
-    Only the crop each tile needs is moved to ``device`` and converted; the
-    result is clamped to [0, 1] like the native bicubic tiles.
+    Separable four-tap bicubic sampling with explicit float32 multiply-adds (no
+    matrix products, so TF32 settings cannot reduce its precision, and a given
+    output coordinate gets the same value in every tile that covers it). Only the
+    crop a tile reads is moved to ``device`` and converted.
     """
     t = grid.tile_size
     tiles = []
     for image_index, row, col in units:
-        my, y0 = cubic_sampling_matrix(grid.source_coordinates(grid.tops[row], t, 0), grid.height)
-        mx, x0 = cubic_sampling_matrix(grid.source_coordinates(grid.lefts[col], t, 1), grid.width)
-        crop = images[image_index, y0 : y0 + my.shape[1], x0 : x0 + mx.shape[1]]
-        crop = crop.to(device=device, dtype=torch.float32).clamp(0.0, 1.0).permute(2, 0, 1)
-        my = my.to(device=device, dtype=torch.float32)
-        mx = mx.to(device=device, dtype=torch.float32)
-        tile = torch.matmul(torch.matmul(my, crop), mx.transpose(0, 1))  # (3, T, T)
-        del crop, my, mx
+        ty, wy = cubic_taps(grid.source_coordinates(grid.tops[row], t, 0), grid.height)
+        tx, wx = cubic_taps(grid.source_coordinates(grid.lefts[col], t, 1), grid.width)
+        y0, x0 = int(ty.min()), int(tx.min())
+        crop = images[image_index, y0 : int(ty.max()) + 1, x0 : int(tx.max()) + 1]
+        crop = crop.to(device=device, dtype=torch.float32).clamp(0.0, 1.0).permute(2, 0, 1)  # (3, h, w)
+        ty, tx = (ty - y0).to(device), (tx - x0).to(device)
+        wy = wy.to(device=device, dtype=torch.float32)
+        wx = wx.to(device=device, dtype=torch.float32)
+        rows = crop[:, ty[:, 0], :] * wy[None, :, 0, None]
+        for k in range(1, 4):
+            rows.addcmul_(crop[:, ty[:, k], :], wy[None, :, k, None])
+        del crop
+        tile = rows[:, :, tx[:, 0]] * wx[None, None, :, 0]
+        for k in range(1, 4):
+            tile.addcmul_(rows[:, :, tx[:, k]], wx[None, None, :, k])
+        del rows
         tiles.append(tile.clamp_(0.0, 1.0)[None])
     return torch.cat(tiles).contiguous()
 
