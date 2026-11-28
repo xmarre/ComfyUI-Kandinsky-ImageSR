@@ -277,7 +277,8 @@ def upscale(
     ``correction_strength`` scales the flow update, ``z - s * t * v``, while the
     transformer stays conditioned on ``t``; 0 skips the transformer (VAE round
     trip only). ``reconstruction="residual"`` returns ``tile + decode(z_sr) -
-    decode(z_lq)`` (an extra VAE decode per tile) instead of ``decode(z_sr)``.
+    decode(z_lq)`` (an extra VAE decode per tile) instead of ``decode(z_sr)``; with
+    strength 0 that is the sampled input itself, returned without VAE work.
     """
     import comfy.model_management as mm
     import comfy.utils
@@ -335,8 +336,10 @@ def upscale(
     requested = min(tile_batch_size, total_tiles) if tile_batch_size > 0 else 1
     gpu_acc = live_accumulator_bytes(requested) if accumulation_device == "gpu" else 0
     working = max(requested * per_tile + gpu_acc, resize_bytes)
-    # With no correction the transformer is never evaluated, so it is not loaded.
-    patchers = [vae.patcher] if strength == 0.0 else [model.patcher, vae.patcher]
+    # With no correction the transformer is never evaluated, so it is not loaded; residual
+    # reconstruction without correction returns the sampled input and needs no VAE either.
+    passthrough = strength == 0.0 and reconstruction == "residual"
+    patchers = [] if passthrough else [vae.patcher] if strength == 0.0 else [model.patcher, vae.patcher]
     mm.load_models_gpu(patchers, memory_required=working + output_bytes)
 
     reserved = mm.extra_reserved_memory() if hasattr(mm, "extra_reserved_memory") else 0
@@ -354,7 +357,13 @@ def upscale(
     correction = (
         f"correction strength {strength:g}, applied flow coefficient {strength * timestep:g}"
         + (", residual reconstruction" if reconstruction == "residual" else "")
-        + (" (no transformer evaluation)" if strength == 0.0 else "")
+        + (
+            " (sampled input returned unchanged; no VAE or transformer evaluation)"
+            if passthrough
+            else " (no transformer evaluation)"
+            if strength == 0.0
+            else ""
+        )
     )
     if isinstance(grid, DirectGrid):
         restoration = (

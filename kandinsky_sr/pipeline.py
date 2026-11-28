@@ -87,8 +87,12 @@ class RunStats:
     output_size: tuple[int, int] | None = None
     #: True when assembling the final output ran out of device memory and finished in system memory.
     assembly_fallback: bool = False
-    #: Tiles that went through the transformer (0 when the correction strength is 0).
+    #: Tiles whose transformer result was committed to the output (0 when the correction
+    #: strength is 0). Work discarded by an out-of-memory retry is not included.
     transformer_evaluations: int = 0
+    #: Tiles submitted to the transformer, including batches that were discarded and
+    #: retried after an out-of-memory error.
+    transformer_tiles_submitted: int = 0
 
 
 class _Accumulator:
@@ -107,6 +111,7 @@ class TiledRestorer:
         self.grid = grid
         self._windows: dict[tuple[torch.device, bool, bool, bool, bool], torch.Tensor] = {}
         self._clamp_output = False
+        self._submitted = 0
 
     # ------------------------------------------------------------------ helpers
 
@@ -159,6 +164,10 @@ class TiledRestorer:
         backend = self.backend
         device = backend.compute_device
         pixels = self._model_pixels(images, units, device)
+        strength = opts.correction_strength
+        if opts.residual and strength == 0.0:
+            # pixels + decode(z) - decode(z): the sampled input itself, without VAE work
+            return pixels
         if not pixels.is_contiguous():
             raise RuntimeError("internal error: VAE input must be NCHW-contiguous")
         self._check_interrupt(opts)
@@ -166,10 +175,10 @@ class TiledRestorer:
         if not opts.residual:
             del pixels
         self._check_interrupt(opts)
-        strength = opts.correction_strength
         if strength == 0.0:
             corrected = latents  # no correction: the transformer is not evaluated
         else:
+            self._submitted += len(units)
             velocity = backend.transform(latents, opts.timestep_index)
             coefficient = opts.timestep if strength == 1.0 else strength * opts.timestep
             corrected = latents - coefficient * velocity
@@ -215,6 +224,7 @@ class TiledRestorer:
         acc_device = opts.accumulation_device
         prepared = None
         self._clamp_output = opts.residual
+        self._submitted = 0
 
         try:
             while position < len(queue):
@@ -254,6 +264,7 @@ class TiledRestorer:
 
             if accumulators:
                 raise RuntimeError("internal error: unfinished tile accumulators")
+            stats.transformer_tiles_submitted = self._submitted
         except BaseException as error:
             # The traceback keeps this frame alive: drop the output batch and the
             # current tile batch, and clear the finished helper frames (commit,

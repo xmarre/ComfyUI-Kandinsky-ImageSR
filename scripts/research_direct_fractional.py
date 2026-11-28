@@ -22,9 +22,12 @@ scale, optional JPEG) and restores it back to the reference size with:
 The transformer runs once per image and setting; its velocity is reused for
 every strength (it does not depend on the strength). References must be at
 most one model tile (1024 px) at the target size so that every result is a
-single tile; one configuration per image is cross-checked against the
-production node path. Metrics: PSNR over RGB, SSIM on luma, PSNR in a central
-face box, high-frequency energy (mean absolute Laplacian of luma relative to
+single tile; one configuration per run is cross-checked against the
+production node path. An interrupted run resumes in the same ``--out`` only
+when ``manifest.json`` there (implementation digest, model and VAE identity,
+precision, strengths, ComfyUI arguments) matches the current invocation; each
+result records the SHA-256 of its reference image. Metrics: PSNR over RGB,
+SSIM on luma, PSNR in a central face box, high-frequency energy (mean absolute Laplacian of luma relative to
 the reference; > 1 is sharper than the reference), luma contrast (standard
 deviation relative to the reference) and mean colour shift.
 """
@@ -32,6 +35,7 @@ deviation relative to the reference) and mean colour shift.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import math
@@ -50,7 +54,8 @@ for _path in (str(Path(__file__).resolve().parent), str(Path(__file__).resolve()
         sys.path.append(_path)
 
 from kandinsky_sr.config import CREATIVITY_TIMESTEPS  # noqa: E402
-from kandinsky_sr.direct import DirectGrid, plan_grid, sample_tiles  # noqa: E402
+from kandinsky_sr.direct import DirectGrid, DirectRestorer, plan_grid  # noqa: E402
+from kandinsky_sr.pipeline import TiledRestorer  # noqa: E402
 from kandinsky_sr.resize import resize_rgb, scaled_length  # noqa: E402
 from kandinsky_sr.tiling import make_grid  # noqa: E402
 
@@ -157,6 +162,74 @@ def metrics(out: torch.Tensor, ref: torch.Tensor) -> dict:
 # ----------------------------------------------------------------------------- experiment
 
 
+def model_input(backend, grid, images: torch.Tensor) -> torch.Tensor:
+    """The single model tile ``(1, 3, T, T)`` the production restorer feeds for ``grid``.
+
+    A :class:`DirectGrid` samples the input directly; the native grid (an exact
+    2x request) uses the native tile preprocessing.
+    """
+    if grid.num_tiles != 1:
+        raise ValueError(f"the experiment needs a single model tile, the plan has {grid.num_tiles}")
+    restorer = (DirectRestorer if isinstance(grid, DirectGrid) else TiledRestorer)(backend, grid)
+    return restorer._model_pixels(images, [(0, 0, 0)], backend.compute_device)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _safetensors_identity(path: Path) -> dict:
+    """Size and header digest of a safetensors file (the header lists every tensor's dtype, shape and offsets)."""
+    with open(path, "rb") as handle:
+        prefix = handle.read(8)
+        header = handle.read(int.from_bytes(prefix, "little")) if len(prefix) == 8 else b""
+    return {"name": path.name, "bytes": path.stat().st_size, "header_sha256": _sha256(prefix + header)}
+
+
+def implementation_digest() -> str:
+    """Digest of the package sources and this script, which together define every result."""
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for path in sorted((root / "kandinsky_sr").glob("*.py")) + [Path(__file__).resolve()]:
+        digest.update(path.name.encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()
+
+
+def manifest(args) -> dict:
+    """Everything besides the image content that determines a result."""
+    return {
+        "implementation_sha256": implementation_digest(),
+        "torch": torch.__version__,
+        "model": _safetensors_identity(Path(args.model)),
+        "vae": _safetensors_identity(Path(args.vae)),
+        "weight_dtype": "bf16",
+        "vae_dtype": args.vae_dtype,
+        "family": 2,
+        "overlap": 0.25,
+        "strengths": [float(s) for s in args.strengths],
+        "comfy_args": list(args.comfy_args),
+    }
+
+
+def check_resume(out_dir: Path, current: dict) -> list:
+    """Existing results of ``out_dir`` if they were produced under ``current``, else ``SystemExit``.
+
+    Results are only reused when every input that determines them is unchanged;
+    anything else must go to a new output directory.
+    """
+    results_path, manifest_path = out_dir / "results.json", out_dir / "manifest.json"
+    if not results_path.exists():
+        return []
+    if not manifest_path.exists():
+        raise SystemExit(f"{out_dir}: results without a manifest cannot be resumed; choose a new --out")
+    previous = json.loads(manifest_path.read_text())
+    if previous != current:
+        changed = sorted(k for k in current.keys() | previous.keys() if current.get(k) != previous.get(k))
+        raise SystemExit(f"{out_dir}: existing results were produced with different {', '.join(changed)}; "
+                         "choose a new --out")  # fmt: skip
+    return json.loads(results_path.read_text())
+
+
 def _load(args):
     from _comfy_bootstrap import bootstrap, load_flux_vae
 
@@ -174,14 +247,18 @@ def _load(args):
 
 
 def _experiment(args) -> None:
-    runtime, model, vae, backend = _load(args)
     out_dir = Path(args.out)
-    results = json.loads((out_dir / "results.json").read_text()) if (out_dir / "results.json").exists() else []
-    done = {(r["image"], r["scale"], r["creativity"], r["jpeg"]) for r in results}
+    current = manifest(args)
+    results = check_resume(out_dir, current)  # before the model is loaded
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "manifest.json").write_text(json.dumps(current, indent=1))
+    runtime, model, vae, backend = _load(args)
+    done = {(r["image"], r["image_sha256"], r["scale"], r["creativity"], r["jpeg"]) for r in results}
     checked = False
     for path in map(Path, args.images):
         reference = _read(path)
         name = path.stem
+        image_sha256 = _sha256(path.read_bytes())
         h, w = reference.shape[1:3]
         for s in args.scales:
             scale = Decimal(str(s))
@@ -197,11 +274,18 @@ def _experiment(args) -> None:
             grid = plan_grid(lq_h, lq_w, (h, w), 2, TILE, 0.25)
             assert isinstance(grid, DirectGrid) or s == 2.0
             for c in args.creativity:
-                if (name, s, c, args.jpeg) in done:
+                if (name, image_sha256, s, c, args.jpeg) in done:
                     continue
                 t = CREATIVITY_TIMESTEPS[2][c]
                 index = model.config.timestep_index(t)
-                record = {"image": name, "scale": s, "creativity": c, "jpeg": args.jpeg, "timestep": t}
+                record = {
+                    "image": name,
+                    "image_sha256": image_sha256,
+                    "scale": s,
+                    "creativity": c,
+                    "jpeg": args.jpeg,
+                    "timestep": t,
+                }
                 record["input_size"], record["output_size"] = [lq_h, lq_w], [h, w]
                 start = time.perf_counter()
                 with torch.no_grad():
@@ -214,7 +298,7 @@ def _experiment(args) -> None:
                 _write(calibrated, folder / f"B_calibrated2x_c{c}.png")
                 with torch.no_grad():
                     start = time.perf_counter()
-                    base = sample_tiles(lq, [(0, 0, 0)], grid, backend.compute_device)  # (1, 3, T, T)
+                    base = model_input(backend, grid, lq)  # (1, 3, T, T)
                     z = backend.encode(base)
                     v = backend.transform(z, index)
                     seconds_model = time.perf_counter() - start

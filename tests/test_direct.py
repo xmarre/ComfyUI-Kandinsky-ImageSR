@@ -226,9 +226,13 @@ def test_residual_reconstruction():
     images = _images(1, 60, 70)
     grid = _direct(60, 70, "1.2")
     base, _ = _run(IdentityBackend(), images, grid)
-    # zero correction: the decoded difference vanishes and the sampled input is returned
-    zero, _ = _run(FakeBackend(), images, grid, correction_strength=0.0, residual=True)
+    # zero correction: the decoded difference vanishes, so the sampled input is returned
+    # without any VAE or transformer work
+    passthrough = FakeBackend()
+    zero, zstats = _run(passthrough, images, grid, correction_strength=0.0, residual=True)
     torch.testing.assert_close(zero, base, rtol=0, atol=1e-6)
+    assert passthrough.calls["encode"] == passthrough.calls["decode"] == passthrough.calls["transform"] == 0
+    assert zstats.tiles == grid.num_tiles and zstats.transformer_evaluations == zstats.transformer_tiles_submitted == 0
     # sign and magnitude: input + decode(z_sr) - decode(z_lq), clamped once after blending
     backend = FakeBackend()
     latent, _ = _run(FakeBackend(), images, grid)
@@ -236,6 +240,7 @@ def test_residual_reconstruction():
     residual, stats = _run(backend, images, grid, residual=True)
     torch.testing.assert_close(residual, (base + latent - vae_only).clamp(0, 1), rtol=0, atol=1e-5)
     assert backend.calls["decode"] == 2 * grid.num_tiles and stats.transformer_evaluations == grid.num_tiles
+    assert stats.transformer_tiles_submitted == grid.num_tiles
     assert residual.min() >= 0 and residual.max() <= 1
 
 
@@ -260,6 +265,25 @@ def test_sampling_oom_is_retried_transactionally(monkeypatch):
     torch.testing.assert_close(out, expected, rtol=0, atol=1e-6)
     assert stats.oom_retries == 1 and set(stats.batch_sizes) <= {2} and stats.tiles == 2 * grid.num_tiles
     assert tracker.live == 0
+
+
+def test_transformer_statistics_separate_committed_and_discarded_work(monkeypatch):
+    """An OOM after the transformer ran discards that work: it is submitted, not committed."""
+    images = _images(2, 150, 170)
+    grid = _direct(150, 170, "1.3")
+    backend = FakeBackend()
+    real_decode = backend.decode
+
+    def flaky_decode(latents):
+        if latents.shape[0] > 2:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory (decode)")
+        return real_decode(latents)
+
+    monkeypatch.setattr(backend, "decode", flaky_decode)
+    _, stats = _run(backend, images, grid, batch=4)
+    total = 2 * grid.num_tiles
+    assert stats.oom_retries == 1 and stats.transformer_evaluations == total
+    assert stats.transformer_tiles_submitted == total + 4  # the discarded first batch of four
 
 
 @pytest.mark.parametrize("stage", ["sample", "encode", "transform", "decode"])

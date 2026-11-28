@@ -12,7 +12,13 @@ Memory is reported from two sources, kept separate: PyTorch's caching allocator
 the driver (``device_used_*_gib``; total minus free, so it includes other
 processes, CUDA context and allocations outside PyTorch's allocator such as those
 of ComfyUI's dynamic VRAM manager). ``transformer_loaded_gib`` is the transformer
-weight memory ComfyUI reports as resident on the device after each run.
+weight memory ComfyUI reports as resident on the device after each run. Both
+models are loaded once before the first configuration and stay loaded unless
+``--unload-between-configs`` is given; without it, a configuration that does
+not need the transformer (correction strength 0) still runs with it resident.
+``transformer_evaluations`` counts tiles whose transformer result reached the
+output; ``transformer_tiles_submitted`` also counts work discarded by
+out-of-memory retries.
 
 Example::
 
@@ -107,6 +113,13 @@ def main() -> None:
         "--restoration-modes", nargs="+", default=["calibrated"], choices=["calibrated", "direct_fractional"]
     )
     parser.add_argument("--correction-strengths", type=float, nargs="+", default=[1.0])
+    parser.add_argument(
+        "--unload-between-configs",
+        action="store_true",
+        help="unload all models before each configuration, so memory residency reflects only what that "
+        "configuration loads (for example no transformer at correction strength 0); the first repetition "
+        "then includes loading, so use --warmup 1 or more for timing",
+    )
     parser.add_argument("--reconstructions", nargs="+", default=["latent"], choices=["latent", "residual"])
     parser.add_argument(
         "--stages",
@@ -208,6 +221,9 @@ def main() -> None:
                 if o <= (4 if m == "direct_fractional" else factor)
             ):
                 repetitions = []
+                if args.unload_between_configs:
+                    mm.unload_all_models()
+                    mm.soft_empty_cache()
                 for k in range(args.warmup + args.repeats):
                     for v in stage_times.values():
                         v.clear()
@@ -251,6 +267,7 @@ def main() -> None:
                         "assembly_fallback": stats.assembly_fallback,
                         "tiles": stats.tiles,
                         "transformer_evaluations": stats.transformer_evaluations,
+                        "transformer_tiles_submitted": stats.transformer_tiles_submitted,
                         "effective_batch": stats.final_batch_size,
                         "batch_sizes": sorted(set(stats.batch_sizes)),
                         "oom_retries": stats.oom_retries,

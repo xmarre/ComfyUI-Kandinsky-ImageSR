@@ -260,8 +260,9 @@ class KandinskyImageSRUpscale(io.ComfyNode):
                     tooltip=(
                         "Multiplier of the model's correction: z - strength * t * v. The model is still conditioned "
                         "on the creativity timestep t; only the size of the applied update changes. 1.0 = the "
-                        "official full correction. 0 skips the model entirely (VAE round trip only). Lower values "
-                        "are mainly useful with direct_fractional restoration."
+                        "official full correction. 0 skips the transformer (VAE round trip only; with residual "
+                        "reconstruction the bicubic input is returned without any model work). Lower values are "
+                        "mainly useful with direct_fractional restoration."
                     ),
                 ),
                 io.Combo.Input(

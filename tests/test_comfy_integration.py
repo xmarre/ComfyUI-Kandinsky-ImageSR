@@ -1327,6 +1327,35 @@ def test_zero_strength_does_not_load_or_run_the_transformer(env, monkeypatch):
     assert model.patcher not in loaded[-1] and stats[-1][1].transformer_evaluations == 0
 
 
+def test_zero_strength_residual_loads_no_model_and_returns_the_sampled_input(env, monkeypatch):
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    loaded = []
+    real_load = mm.load_models_gpu
+    monkeypatch.setattr(
+        mm, "load_models_gpu", lambda models, **kw: loaded.append(list(models)) or real_load(models, **kw)
+    )
+
+    def unused(*args, **kwargs):
+        raise AssertionError("no model stage may run for residual reconstruction at strength 0")
+
+    for stage in ("encode", "transform", "decode"):
+        monkeypatch.setattr(runtime._ComfyBackend, stage, unused)
+    image = _image()
+    out = _run(
+        env, model, image, restoration_mode="direct_fractional", output_scale=1.3, correction_strength=0.0,
+        reconstruction="residual",
+    )  # fmt: skip
+    assert loaded[-1] == [] and out.shape[1:3] == (52, 73)
+    # every output pixel is a normalised blend of identical samples, i.e. the global bicubic sample
+    expected = torch.nn.functional.interpolate(
+        image.permute(0, 3, 1, 2), size=(52, 73), mode="bicubic", align_corners=False
+    ).clamp(0, 1)
+    torch.testing.assert_close(out.float(), expected.permute(0, 2, 3, 1), rtol=0, atol=1e-5)
+
+
 @pytest.mark.parametrize(
     "kwargs,message",
     [

@@ -279,8 +279,10 @@ transformer stays conditioned on the creativity timestep:
 
 - `1.0` is the official formula; with the defaults, calibrated restoration is
   unchanged bit for bit.
-- `0` is the VAE round trip only: the transformer is neither loaded nor run,
-  and the log reports no transformer evaluation.
+- `0` with `latent` reconstruction is the VAE round trip only: the
+  transformer is neither loaded nor run, and the log reports no transformer
+  evaluation. With `residual` reconstruction, `0` returns the sampled bicubic
+  input itself without loading or running either model.
 - Values in between apply a proportionally smaller correction. This is a
   continuous, post-hoc scaling of one prediction, not a calibrated timestep.
 
@@ -295,7 +297,9 @@ observed in direct mode.
 - `residual`: `bicubic tile + decode(z_sr) − decode(z_lq)`, clamped to [0, 1]
   after blending. Only the decoded effect of the correction is added to the
   model's input tile, so the VAE's own reconstruction loss cancels. Costs one
-  additional VAE decode per tile and one tile of extra working memory.
+  additional VAE decode per tile and one tile of extra working memory. At
+  `correction_strength` 0 the result is exactly the sampled input, returned
+  without any model work.
 
 ### Geometry
 
