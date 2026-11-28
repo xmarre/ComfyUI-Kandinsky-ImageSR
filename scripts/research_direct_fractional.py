@@ -26,6 +26,9 @@ Geometry (all in output pixels):
 Subcommands::
 
     tiles      exact transformer tile counts of native 2x/4x vs direct scales
+               (``experiment`` reports PSNR on RGB and SSIM on luma; its timings
+               are exploratory: the native arm runs the full node runtime, the
+               direct arm only the tile loop, without warm-up or repetitions)
     run        restore one image directly at a scale (needs the model)
     experiment compare bicubic, native 2x + resize, and direct restoration on
                degraded versions of clean reference images (needs the model)
@@ -263,6 +266,7 @@ def _luma(image: torch.Tensor) -> torch.Tensor:
 
 
 def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
+    """PSNR over all RGB channels (peak 1.0)."""
     mse = float(((a - b) ** 2).mean())
     return float("inf") if mse == 0 else 10 * math.log10(1.0 / mse)
 
@@ -331,7 +335,7 @@ def _experiment(args) -> None:
                 entry = {"t": t}
                 start = time.perf_counter()
                 with torch.no_grad():
-                    native, stats = runtime.upscale(model, lq, 2, c, output_scale=s, vae=vae)
+                    native, stats = runtime.upscale(model, lq, 2, c, overlap=args.overlap, output_scale=s, vae=vae)
                 entry["native_resized"] = {
                     "psnr": psnr(native, clean),
                     "ssim": ssim(native, clean),

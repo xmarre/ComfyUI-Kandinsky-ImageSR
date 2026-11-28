@@ -88,3 +88,20 @@ def test_oom_classification():
     assert not is_oom(RuntimeError("mat1 and mat2 shapes cannot be multiplied"))
     assert not is_oom(ValueError("out of memory"))
     assert not is_oom(KeyError("x"))
+
+
+def test_genuine_cpu_allocation_failure_is_recognised_narrowly():
+    from kandinsky_sr.memory import is_host_alloc_failure
+
+    try:
+        torch.empty(2**47, dtype=torch.uint8)  # 128 TiB: refused by the CPU allocator
+    except RuntimeError as error:
+        genuine = error
+    else:  # pragma: no cover - a machine that grants this cannot produce the failure
+        pytest.skip("the allocator granted 128 TiB")
+    assert is_host_alloc_failure(genuine)
+    assert is_host_alloc_failure(MemoryError())
+    assert is_host_alloc_failure(RuntimeError("[enforce fail] DefaultCPUAllocator: not enough memory: you tried"))
+    assert not is_host_alloc_failure(RuntimeError("shape mismatch"))
+    assert not is_host_alloc_failure(RuntimeError("can't allocate memory for the cache"))
+    assert not is_host_alloc_failure(ValueError("DefaultCPUAllocator: can't allocate memory"))

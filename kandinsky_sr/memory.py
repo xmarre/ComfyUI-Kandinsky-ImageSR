@@ -140,5 +140,22 @@ def is_oom(error: BaseException) -> bool:
     return isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
 
 
+def is_host_alloc_failure(error: BaseException) -> bool:
+    """True for a failed system-memory allocation (PyTorch's CPU allocator or Python).
+
+    PyTorch reports these as a plain ``RuntimeError`` from ``DefaultCPUAllocator``
+    ("can't allocate memory" on Linux/macOS, "not enough memory" on Windows), which
+    accelerator out-of-memory classifiers do not recognise.
+    """
+    if isinstance(error, MemoryError):
+        return True
+    message = str(error)
+    return (
+        isinstance(error, RuntimeError)
+        and "DefaultCPUAllocator" in message
+        and ("can't allocate memory" in message or "not enough memory" in message)
+    )
+
+
 def format_bytes(value: float) -> str:
     return f"{value / _GIB:.2f} GiB"

@@ -33,6 +33,12 @@ def test_zero_means_native_size(value):
         (2.5, 2, "select the 4x"),
         (4.01, 4, "must not exceed 4.0"),
         (5, 4, "must not exceed 4.0"),
+        (0.9999999, 2, "at least 1.0"),  # would round to 1.000000; rejected before rounding
+        (2.0000001, 2, "select the 4x"),
+        (4.0000001, 4, "must not exceed 4.0"),
+        (1e100, 4, "must not exceed 4.0"),  # never reaches decimal quantisation
+        (1.7976931348623157e308, 4, "must not exceed 4.0"),
+        (-1e100, 4, "at least 1.0"),
         (True, 2, "must be a number"),
         ("1.5", 2, "must be a number"),
         (None, 2, "must be a number"),
@@ -47,6 +53,15 @@ def test_invalid_output_scales_are_rejected_not_clamped(value, factor, message):
 @pytest.mark.parametrize("value,factor", [(1, 2), (1.0, 4), (1.2, 2), (2, 2), (2.0, 4), (2.25, 4), (3.2, 4), (4, 4)])
 def test_valid_output_scales(value, factor):
     assert validate_output_scale(value, factor) == Decimal(str(float(value)))
+
+
+def test_endpoint_tolerance_covers_only_floating_point_noise():
+    assert validate_output_scale(1.0 - 1e-12, 2) == Decimal(1)
+    assert validate_output_scale(2.0 + 1e-12, 2) == Decimal(2)
+    assert validate_output_scale(4.0 + 1e-12, 4) == Decimal(4)
+    for value, factor in ((1.0 - 2e-9, 2), (2.0 + 2e-9, 2), (4.0 + 2e-9, 4)):
+        with pytest.raises(ValueError):
+            validate_output_scale(value, factor)
 
 
 def test_float_noise_from_widgets_does_not_change_the_scale():

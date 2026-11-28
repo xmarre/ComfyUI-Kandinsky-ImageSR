@@ -17,6 +17,7 @@ from .memory import (
     auto_tile_batch,
     choose_accumulation_device,
     format_bytes,
+    is_host_alloc_failure,
     is_oom,
     max_active_accumulators,
     tile_io_bytes,
@@ -364,7 +365,6 @@ def upscale(
     out_dtype = mm.intermediate_dtype() if hasattr(mm, "intermediate_dtype") else torch.float32
     stats.output_size = final_size
     if resize:
-        mm.throw_exception_if_processing_interrupted()
 
         def assemble(native: torch.Tensor) -> torch.Tensor:
             return _finish_resized(native, alpha, final_size, out_dtype, mm.throw_exception_if_processing_interrupted)
@@ -374,7 +374,21 @@ def upscale(
         def assemble(native: torch.Tensor) -> torch.Tensor:
             return _finish_output(native, alpha, grid, out_dtype)
 
-    return assemble_output(output, assemble, final_size, on_oom=mm.soft_empty_cache), stats
+    def on_fallback() -> None:
+        stats.assembly_fallback = True
+        mm.soft_empty_cache()
+
+    try:
+        if resize:
+            mm.throw_exception_if_processing_interrupted()
+        final = assemble_output(output, assemble, final_size, on_oom=on_fallback)
+    except BaseException as error:
+        # The propagated traceback keeps this frame alive: release the native
+        # restoration here, and the locals of the finished assembly frames.
+        output = None
+        traceback.clear_frames(error.__traceback__)
+        raise
+    return final, stats
 
 
 def _same_device(a: torch.device, b: torch.device) -> bool:
@@ -396,18 +410,25 @@ class OutputAssemblyError(RuntimeError):
     """The restored image could not be assembled into the final output (out of memory)."""
 
 
+def _out_of_memory(error: BaseException) -> bool:
+    return is_oom(error) or is_host_alloc_failure(error)
+
+
 def assemble_output(output: torch.Tensor, assemble, size: tuple[int, int], on_oom=None) -> torch.Tensor:
     """``assemble(output)``; on out-of-memory on an accelerator, again in system memory.
 
     The native restoration is never rerun: only the assembly step (alpha, final
-    resize, dtype conversion) is retried, from the already restored ``output``.
-    Errors other than out-of-memory propagate unchanged.
+    resize, dtype conversion) is retried, from the already restored ``output``,
+    which is moved to system memory as part of the retry. ``assemble`` must do
+    all its work on ``output``'s device. Errors other than running out of device
+    or system memory propagate unchanged.
     """
+    images = output.shape[0]
     failure = None
     try:
         return assemble(output)
     except Exception as error:
-        if not is_oom(error):
+        if not _out_of_memory(error):
             raise
         traceback.clear_frames(error.__traceback__)
         failure = error if output.device.type == "cpu" else None
@@ -415,18 +436,19 @@ def assemble_output(output: torch.Tensor, assemble, size: tuple[int, int], on_oo
         logger.warning("Kandinsky ImageSR: out of memory while assembling the output; finishing in system memory")
         if on_oom is not None:
             on_oom()
-        output = output.cpu()
         try:
+            output = output.cpu()
             return assemble(output)
         except Exception as error:
-            if not is_oom(error):
+            if not _out_of_memory(error):
                 raise
             traceback.clear_frames(error.__traceback__)
             failure = error
+    output = None  # the exception below references this frame
     height, width = size
     raise OutputAssemblyError(
         f"Kandinsky ImageSR: the restoration finished, but there is not enough system memory to assemble the "
-        f"{width}x{height} output of {output.shape[0]} image(s). Free system memory, process fewer images at once, "
+        f"{width}x{height} output of {images} image(s). Free system memory, process fewer images at once, "
         "or choose a smaller output_scale."
     ) from failure
 
@@ -463,7 +485,9 @@ def _finish_resized(
         interrupt()
         final[index, ..., :3].copy_(resize_rgb(output[index : index + 1], size)[0])
     if alpha is not None:
-        resized = F.interpolate(alpha.movedim(-1, 1).float(), size=size, mode="bilinear", align_corners=False)
+        # on the output's device, so a fallback to system memory does no GPU work
+        source = alpha.movedim(-1, 1).to(device=output.device, dtype=torch.float32)
+        resized = F.interpolate(source, size=size, mode="bilinear", align_corners=False)
         final[..., 3:].copy_(resized.clamp_(0.0, 1.0).movedim(1, -1))
         del resized
     return final
@@ -473,8 +497,13 @@ def _finish_output(output: torch.Tensor, alpha: torch.Tensor | None, grid, out_d
     if alpha is not None:
         # Alpha is not part of the generative model: resize it bilinearly to the
         # exact output size and append it unchanged in meaning.
+        # On the output's device (a no-op when the image is already there), so a
+        # fallback to system memory does no GPU work.
         resized = F.interpolate(
-            alpha.movedim(-1, 1).float(), size=(grid.out_height, grid.out_width), mode="bilinear", align_corners=False
+            alpha.movedim(-1, 1).to(output.device).float(),
+            size=(grid.out_height, grid.out_width),
+            mode="bilinear",
+            align_corners=False,
         ).clamp_(0.0, 1.0)
         output = torch.cat([output, resized.movedim(1, -1).to(output)], dim=-1)
         del resized

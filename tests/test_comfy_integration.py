@@ -1038,3 +1038,130 @@ def test_final_resize_memory_is_budgeted_for_device_resident_outputs(env, monkey
     final = 3 * 240 * 360 * 4 * 4  # RGBA FP32 bound
     assert resize == 0 or resize == final + max(12 * (400 * 600 + 400 * 360 + 240 * 360), 3 * 240 * 360 * 4)
     assert requested == [max(per_tile, resize) + output]
+
+
+def _host_alloc_failure():
+    """The genuine error of PyTorch's CPU allocator (not an accelerator OOM type)."""
+    torch.empty(2**47, dtype=torch.uint8)
+
+
+@pytest.mark.parametrize("resize", [True, False])
+def test_alpha_is_assembled_on_the_output_device(env, monkeypatch, resize):
+    """After a fallback the output is in system memory; alpha must follow it, not stay on the GPU."""
+    import torch.nn.functional as F
+
+    runtime = env["module"]("runtime")
+    devices = []
+    real = F.interpolate
+
+    def spy(tensor, *args, **kwargs):
+        devices.append(tensor.device.type)
+        return real(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(F, "interpolate", spy)
+    output = torch.zeros(2, 20, 30, 3, device="meta")  # stands in for "a device other than alpha's"
+    alpha = torch.rand(2, 10, 15, 1)
+    if resize:
+        out = runtime._finish_resized(output, alpha, (13, 19), torch.float32, lambda: None)
+    else:
+        out = runtime._finish_output(output, alpha, runtime.make_grid(10, 15, 2, 1024, 0.25), torch.float32)
+    assert out.device.type == "meta" and out.shape[-1] == 4
+    assert devices and set(devices) == {"meta"}
+
+
+def test_genuine_cpu_allocation_failure_raises_the_assembly_error(env):
+    runtime = env["module"]("runtime")
+
+    def assemble(output):
+        _host_alloc_failure()
+
+    with pytest.raises(runtime.OutputAssemblyError, match="not enough system memory"):
+        runtime.assemble_output(torch.zeros(1, 4, 5, 3), assemble, (4, 5))
+
+
+def test_device_oom_then_genuine_cpu_failure_raises_the_assembly_error(env):
+    runtime = env["module"]("runtime")
+    fallbacks = []
+
+    def assemble(output):
+        if output.device.type != "cpu":
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+        _host_alloc_failure()
+
+    with pytest.raises(runtime.OutputAssemblyError):
+        runtime.assemble_output(
+            _OnDevice(torch.zeros(1, 4, 5, 3)), assemble, (4, 5), on_oom=lambda: fallbacks.append(1)
+        )
+    assert fallbacks == [1]
+
+
+class _FailingTransfer(_OnDevice):
+    def __init__(self, tensor, error):
+        super().__init__(tensor)
+        self.error = error
+
+    def cpu(self):
+        if self.error is None:
+            _host_alloc_failure()
+        raise self.error
+
+
+def test_failure_moving_the_output_to_system_memory_is_handled(env):
+    runtime = env["module"]("runtime")
+
+    def assemble(output):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+    with pytest.raises(runtime.OutputAssemblyError):
+        runtime.assemble_output(_FailingTransfer(torch.zeros(1, 2, 2, 3), None), assemble, (2, 2))
+    with pytest.raises(ValueError, match="unrelated"):  # not a memory failure: propagates unchanged
+        runtime.assemble_output(_FailingTransfer(torch.zeros(1, 2, 2, 3), ValueError("unrelated")), assemble, (2, 2))
+
+
+def _native_output_ref(env, monkeypatch):
+    runtime = env["module"]("runtime")
+    refs = []
+    real_run = runtime.TiledRestorer.run
+
+    def spy(self, images, opts):
+        output, stats = real_run(self, images, opts)
+        refs.append(weakref.ref(output))
+        return output, stats
+
+    monkeypatch.setattr(runtime.TiledRestorer, "run", spy)
+    return refs
+
+
+@pytest.mark.parametrize("failure", ["error", "system_memory", "cancel"])
+@pytest.mark.parametrize("scale", [0.0, 1.5])
+def test_native_output_is_released_when_assembly_fails(env, monkeypatch, failure, scale):
+    """The caller may keep the exception (ComfyUI reports it); it must not pin the restored image."""
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    refs = _native_output_ref(env, monkeypatch)
+
+    def fail(*args, **kwargs):
+        if failure == "error":
+            raise RuntimeError("assembly failed")
+        if failure == "system_memory":
+            _host_alloc_failure()
+        mm.interrupt_current_processing(True)
+        mm.throw_exception_if_processing_interrupted()
+
+    monkeypatch.setattr(runtime, "resize_rgb" if scale else "_finish_output", fail)
+    caught = None
+    try:
+        _run(env, model, _image(batch=2, h=60, w=70), output_scale=scale)
+    except BaseException as error:  # noqa: BLE001 - kept on purpose
+        caught = error
+    finally:
+        mm.interrupt_current_processing(False)
+    assert caught is not None and caught.__traceback__ is not None
+    expected = {"error": RuntimeError, "system_memory": runtime.OutputAssemblyError}.get(
+        failure, mm.InterruptProcessingException
+    )
+    assert isinstance(caught, expected)
+    gc.collect()
+    assert refs and refs[0]() is None, "the native restoration outlives the failed call"

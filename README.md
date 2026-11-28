@@ -194,7 +194,9 @@ sets the final size independently:
   size; `1.2` turns 1000×1000 into 1200×1200.
 - Values above the native factor are rejected (for example 2.5 with
   `2x`: select the `4x` native scale); values between 0 and 1, negative and
-  non-finite values are rejected as well. Nothing is clamped silently.
+  non-finite values are rejected as well. The range is checked on the value
+  itself; only floating point noise of up to 1e-9 at an endpoint is accepted
+  (`2.0000000000000004` counts as 2, `2.0000001` is rejected).
 
 Dimensions are computed from the original input size, with the scale taken as
 a decimal rounded to six places (so widget float noise such as
@@ -215,9 +217,13 @@ point for photographic restoration where identity and natural texture matter,
 but the best setting depends on the input.
 
 The resize runs on the device that holds the restored image (ComfyUI's
-intermediate device), one image at a time. If it runs out of GPU memory it
-finishes in system memory without repeating the restoration; if that fails as
-well, the node reports how large the output was.
+intermediate device), one image at a time; alpha is processed on the same
+device. If assembling the output runs out of GPU memory, the restored image is
+moved to system memory and the assembly (alpha, resize, dtype conversion) is
+repeated there without repeating the restoration; if system memory is
+insufficient as well, the node reports how large the output was. On failure or
+cancellation the restored image is released rather than kept alive by the
+error.
 
 Direct restoration at a non-native scale (feeding the model tiles enlarged by,
 say, 1.2x instead of 2x) is not part of the node: the released model has no
@@ -450,10 +456,9 @@ bicubic-enlarged tile and one of its baked timesteps. There is no scale or
 degradation input; the two calibrated tables (2x: 0.07–0.30, 4x: 0.17–0.38) do
 not share any timestep, so the scale is implied only by the choice of timestep
 and by how blurred the enlarged input looks. A 1.2x enlargement is much sharper
-than a 2x one, so its latent lies outside what the 2x calibration was made for,
-and the correction `z − t·v` with a 2x timestep is applied to an input that
-needs less of it. The prototype reuses the 2x creativity timesteps for scales
-between 1x and 2x; no calibration exists for this.
+than a 2x one, so its latent plausibly lies outside what the 2x calibration was
+made for. The prototype reuses the 2x creativity timesteps for scales between
+1x and 2x; no calibration exists for this.
 
 **Geometry.** Tiles are placed in output pixels with the official rule
 (1024-pixel tiles, stride `int(1024 × (1 − overlap))`, last tile aligned to the
@@ -469,8 +474,8 @@ identity model, and bit-identical delegation to the native pipeline at exact
 420×1260 reference (a public-domain portrait, a synthetic text and pattern
 chart, a CC0 photograph) was reduced by each scale with antialiased bicubic
 resampling and JPEG-compressed (quality 75); each method then produced the
-reference size. PSNR / SSIM on luma against the reference, creativity 1
-(t = 0.086):
+reference size. PSNR (over RGB) / SSIM (on luma) against the reference,
+creativity 1 (t = 0.086):
 
 | Scale | Bicubic | Native 2x + resize | Direct | Tiles native / direct |
 |---|---|---|---|---|
@@ -486,8 +491,24 @@ direct versus 0.929 / 0.920 / 0.913 native). Visually, direct restoration
 over-sharpens faces and raises contrast, and it invents glyph shapes in small
 text ("Restoration" rendered as "Raslorallon", "13px" as "18px") where native
 2x + resize stays faithful. At 1.0x neither restoration beats the JPEG input in
-PSNR: the restoration changes pixels in ways PSNR penalises. No step
-discontinuities were found at the tile window boundaries.
+PSNR: the restoration changes pixels in ways PSNR penalises. The picture is not
+uniformly negative for the direct path: at 1.2x it still exceeds bicubic in
+PSNR while falling below it in SSIM, and its deficit shrinks to 0.2 dB at 1.5x
+and 1.75x. No step discontinuities were found at the tile window boundaries.
+
+These results compare two complete pipelines on one composite image with one
+degradation; they do not isolate a cause. The pipelines differ in the
+enlargement fed to the transformer, the source area per tile, tile-local versus
+global bicubic sampling, and the antialiased reduction after native
+restoration, which by itself suppresses generated high-frequency texture. A
+timestep that is too strong for the milder enlargement is one plausible
+explanation consistent with the results, not an established one. The exact
+2x/4x control cases delegate to the native pipeline, so they do not show how
+the direct path behaves as the scale approaches 2x; the identity-model tests
+establish geometry and blending only, not equivalence of restoration
+behaviour. The script's timings are exploratory (the native arm runs the full
+node runtime, the direct arm only the tile loop, without warm-up or repeated
+measurements) and are not a speed comparison.
 
 **Cost.** With the implemented placement, a 2048² input needs 9 transformer
 evaluations directly at 1.0x or 1.2x, 16 at 1.5x and 25 at 1.75x, against 25 for
@@ -495,9 +516,10 @@ native 2x (1024²: 1, 4, 4, 4 against 9). The saving disappears towards 2x
 because tile counts are quantised. Per-tile cost is the same, so time scales
 with the tile count; this has not been measured on a GPU.
 
-**Conclusion.** On this evidence direct fractional restoration is faster but
-clearly less faithful, so the node keeps the native restoration followed by a
-resize. The prototype remains available for experiments on other images or
+**Conclusion.** On this evidence direct fractional restoration needs fewer
+transformer evaluations but was less faithful on the tested image, so the node
+keeps the native restoration followed by a resize. A broader benchmark (more
+images and degradations) would be needed for a general verdict. The prototype remains available for experiments on other images or
 with other timestep choices (`--timestep-table 4` reuses the 4x values):
 
 ```bash

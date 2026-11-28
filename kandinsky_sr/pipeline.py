@@ -79,6 +79,8 @@ class RunStats:
     batch_sizes: list[int] = field(default_factory=list)
     #: Final ``(height, width)`` returned to the caller (set by the runtime).
     output_size: tuple[int, int] | None = None
+    #: True when assembling the final output ran out of device memory and finished in system memory.
+    assembly_fallback: bool = False
 
 
 class _Accumulator:

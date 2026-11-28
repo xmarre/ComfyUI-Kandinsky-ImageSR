@@ -9,6 +9,8 @@ input size:
 
 with ``output_scale`` taken as a decimal rounded to six places (so float noise
 such as ``1.2000000000000002`` from a UI widget cannot change a dimension). The
+range ``[1, upscale_factor]`` is checked on the value itself with a tolerance of
+``1e-9`` for floating point noise at the endpoints. The
 resize is antialiased bicubic interpolation in FP32 on NCHW tensors with explicit
 integer target dimensions, clamped to [0, 1]. Native restoration, its tile
 geometry and its creativity calibration are not affected.
@@ -27,6 +29,9 @@ NATIVE = 0.0
 MIN_OUTPUT_SCALE = 1.0
 MAX_OUTPUT_SCALE = 4.0
 _QUANTUM = Decimal("0.000001")
+#: Absolute tolerance at the range endpoints, for binary floating point noise only
+#: (``2.0000000000000004`` is accepted as 2; ``2.0000001`` is rejected).
+ENDPOINT_TOLERANCE = 1e-9
 
 
 def validate_output_scale(output_scale: object, upscale_factor: int) -> Decimal | None:
@@ -42,20 +47,22 @@ def validate_output_scale(output_scale: object, upscale_factor: int) -> Decimal 
         raise ValueError(f"output_scale must be finite, got {output_scale!r}")
     if value == NATIVE:
         return None
-    scale = Decimal(repr(value)).quantize(_QUANTUM, rounding=ROUND_HALF_UP)
-    if scale < MIN_OUTPUT_SCALE:
+    # Range checks on the number itself, before decimal rounding, so rounding cannot
+    # pull an out-of-range value inside (and huge values never reach Decimal).
+    if value < MIN_OUTPUT_SCALE - ENDPOINT_TOLERANCE:
         raise ValueError(
             f"output_scale must be 0 (native size) or at least {MIN_OUTPUT_SCALE}, got {output_scale!r}; "
             "the restoration cannot produce an image smaller than its input"
         )
-    if scale > MAX_OUTPUT_SCALE:
+    if value > MAX_OUTPUT_SCALE + ENDPOINT_TOLERANCE:
         raise ValueError(f"output_scale must not exceed {MAX_OUTPUT_SCALE}, got {output_scale!r}")
-    if scale > upscale_factor:
+    if value > upscale_factor + ENDPOINT_TOLERANCE:
         raise ValueError(
             f"output_scale {output_scale!r} exceeds the native restoration scale {upscale_factor}x; select the "
             "4x upscale_factor for output scales above 2"
         )
-    return scale
+    scale = Decimal(repr(value)).quantize(_QUANTUM, rounding=ROUND_HALF_UP)
+    return min(max(scale, Decimal(MIN_OUTPUT_SCALE)), Decimal(upscale_factor))  # only endpoint noise moves
 
 
 def scaled_length(length: int, scale: Decimal) -> int:

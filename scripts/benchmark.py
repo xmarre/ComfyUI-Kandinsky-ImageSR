@@ -216,6 +216,7 @@ def main() -> None:
                     finally:
                         if sampler is not None:
                             sampler.__exit__(None, None, None)
+                    output_device = str(output.device)
                     # Release the output before the next repetition so it cannot
                     # reduce the memory available to (and the batch chosen by) it.
                     del output
@@ -224,6 +225,9 @@ def main() -> None:
                     rep = {
                         "seconds": seconds,
                         "output_size": list(stats.output_size),
+                        "output_device": output_device,
+                        # final assembly ran out of device memory and finished in system memory
+                        "assembly_fallback": stats.assembly_fallback,
                         "tiles": stats.tiles,
                         "effective_batch": stats.final_batch_size,
                         "batch_sizes": sorted(set(stats.batch_sizes)),
@@ -255,6 +259,7 @@ def main() -> None:
                     # aggregated over all measured repetitions, not taken from the last one
                     "effective_batches": sorted({r["effective_batch"] for r in repetitions}),
                     "oom_retries_total": sum(r["oom_retries"] for r in repetitions),
+                    "assembly_fallbacks": sum(r["assembly_fallback"] for r in repetitions),
                     "repetitions": repetitions,
                 }
                 if device.type == "cuda":
