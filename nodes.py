@@ -272,7 +272,8 @@ class KandinskyImageSRUpscale(io.ComfyNode):
                     tooltip=(
                         "latent: decode the corrected latent (official). residual: add only the decoded effect of "
                         "the correction to the bicubic input, decode(z_sr) - decode(z_lq), which cancels the VAE's "
-                        "own reconstruction loss; costs one extra VAE decode per tile."
+                        "own reconstruction loss (most useful for clean, uncompressed inputs); costs one extra VAE "
+                        "decode per tile."
                     ),
                 ),
             ],
