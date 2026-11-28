@@ -301,8 +301,9 @@ def test_example_workflows_reference_registered_nodes(env, path):
                 if isinstance(spec[0], list) or spec[0] in ("INT", "FLOAT", "COMBO")
             )
 
-        # workflows saved before optional widgets existed carry only the required ones
-        widget_counts[cls_name] = {count("required"), count("required") + count("optional")}
+        # optional widgets are appended in order, so a workflow saved before some of
+        # them existed carries the required ones plus a prefix of the optional ones
+        widget_counts[cls_name] = set(range(count("required"), count("required") + count("optional") + 1))
     ours = 0
     for node in workflow["nodes"]:
         if node["type"] in ("Note", "MarkdownNote"):
