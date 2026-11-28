@@ -17,6 +17,10 @@ super-resolution and image restoration model from Kandinsky Lab.
 - Optional final output scale between 1x and the native factor (for example
   restore at 2x and return 1.2x), produced by resizing the finished
   restoration.
+- Experimental direct fractional restoration: restore directly at 1.0x–4.0x
+  with fewer model evaluations (a 4576² input at 1.2x needs 49 tiles instead of
+  144), with an adjustable correction strength. Uncalibrated; see
+  [Direct fractional restoration](#direct-fractional-restoration-experimental).
 - Automatic tile batching, GPU or CPU blend accumulation, and out-of-memory
   recovery that never duplicates or drops tiles.
 
@@ -33,7 +37,9 @@ input image and the settings.
 The released checkpoint has its text conditioning "baked": the text encoder and
 all cross-attention layers are replaced by per-timestep bias tables for 19
 discrete timesteps. Only those timesteps can be evaluated, which is why the node
-exposes calibrated creativity levels instead of a continuous strength.
+exposes calibrated creativity levels instead of a continuous timestep.
+`correction_strength` scales the applied update `t × v` continuously, but the
+model is always conditioned on one of the baked timesteps.
 
 ## Installation
 
@@ -175,7 +181,10 @@ clear error if it receives another pack's model object.
 | `tile_batch_size` | 0 | 0–64 | Tiles processed together; 0 = automatic. |
 | `accumulation_device` | `auto` | `auto`, `cpu`, `gpu` | Where the FP32 blend buffer lives. |
 | `vae` (optional) | – | | FLUX.1 VAE from Load VAE. Required for the single-file checkpoint; replaces a bundle's own VAE. |
-| `output_scale` (optional) | 0 | 0, or 1.0 to the native factor (max 4.0) | Final size relative to the input; 0 = native size. See [Output scale](#output-scale). |
+| `output_scale` (optional) | 0 | 0, or 1.0 to the native factor (direct mode: 1.0–4.0) | Final size relative to the input; 0 = native size. See [Output scale](#output-scale). |
+| `restoration_mode` (optional) | `calibrated` | `calibrated`, `direct_fractional` | Resize a native restoration, or restore directly at `output_scale` (experimental). See [Direct fractional restoration](#direct-fractional-restoration-experimental). |
+| `correction_strength` (optional) | 1.0 | 0–1 | Multiplier of the applied correction, `z − s·t·v`; 1.0 = official, 0 = VAE round trip without the transformer. |
+| `reconstruction` (optional) | `latent` | `latent`, `residual` | `residual` adds only the decoded correction to the bicubic tile (one extra VAE decode per tile). |
 
 Output: `IMAGE`.
 
@@ -225,10 +234,218 @@ insufficient as well, the node reports how large the output was. On failure or
 cancellation the restored image is released rather than kept alive by the
 error.
 
-Direct restoration at a non-native scale (feeding the model tiles enlarged by,
-say, 1.2x instead of 2x) is not part of the node: the released model has no
-calibration for it. A research prototype and its findings are described under
-[Direct fractional restoration (research)](#direct-fractional-restoration-research).
+This describes the default `calibrated` restoration mode. With
+`restoration_mode = direct_fractional`, `output_scale` instead sets the size
+the model restores at directly, with fewer model evaluations and without a
+final resize; see
+[Direct fractional restoration](#direct-fractional-restoration-experimental).
+
+## Direct fractional restoration (experimental)
+
+`restoration_mode` selects how a size other than the native 2x/4x is produced:
+
+- `calibrated` (default): restore at the native scale the model was calibrated
+  for, then resize (see [Output scale](#output-scale)). Cost is that of the
+  native scale.
+- `direct_fractional`: restore directly at the requested size. The model
+  receives 1024-pixel tiles sampled from the input at `output_scale`, so the
+  number of transformer evaluations follows the requested output size, and no
+  native-resolution image or blend buffer is ever created. There is no hidden
+  2x pass and no final resize.
+
+In direct mode the two inputs that share a meaning in calibrated mode are
+separated:
+
+| Input | Meaning in `direct_fractional` mode |
+|---|---|
+| `output_scale` | The restoration geometry: output `round_half_up(input × output_scale)` per axis, 1.0–4.0 (0 = the family's native size). |
+| `upscale_factor` | Only the *calibration family*: which table of baked timesteps `creativity` selects from (2x: 0.07–0.30, 4x: 0.17–0.38). Any family can be combined with any scale. |
+| `creativity` | The conditioning timestep `t` from that family. |
+| `correction_strength` | The size of the applied correction (below). |
+
+**This mode is uncalibrated.** The released model was calibrated for 2x and 4x
+enlargements only; the transformer has no scale input, so at 1.2x it is
+conditioned on a timestep chosen for 2x while it sees a much sharper input.
+When the requested size is exactly the family's native size (for example 2.0
+with the 2x family), the node runs the native calibrated restoration instead;
+`correction_strength` and `reconstruction` still apply.
+
+### Correction strength
+
+`correction_strength` (0–1, default 1.0) scales the flow update while the
+transformer stays conditioned on the creativity timestep:
+
+    z_sr = z_lq − correction_strength × t × v(z_lq, t)
+
+- `1.0` is the official formula; with the defaults, calibrated restoration is
+  unchanged bit for bit.
+- `0` is the VAE round trip only: the transformer is neither loaded nor run,
+  and the log reports no transformer evaluation.
+- Values in between apply a proportionally smaller correction. This is a
+  continuous, post-hoc scaling of one prediction, not a calibrated timestep.
+
+It applies in both modes; it was introduced to counter the over-correction
+observed in direct mode.
+
+### Reconstruction
+
+`reconstruction` selects how a tile is formed from the corrected latent:
+
+- `latent` (default, official): `decode(z_sr)`.
+- `residual`: `bicubic tile + decode(z_sr) − decode(z_lq)`, clamped to [0, 1]
+  after blending. Only the decoded effect of the correction is added to the
+  model's input tile, so the VAE's own reconstruction loss cancels. Costs one
+  additional VAE decode per tile and one tile of extra working memory.
+
+### Geometry
+
+All tile placement is in output pixels:
+
+- one global mapping: output pixel centre `o` samples the input at
+  `(o + 0.5) × in / out − 0.5`;
+- 1024-pixel tiles at stride `int(1024 × (1 − overlap))` with the last tile
+  aligned to the far edge (the official tiling rule, applied in output space),
+  blended with the native boundary-aware Hann windows;
+- each tile is a separable four-tap bicubic sample (PyTorch's `A = −0.75`
+  kernel, border taps clamped) of only the crop of the input it needs, computed
+  with explicit FP32 multiply-adds, so overlapping tiles receive identical
+  values and TF32 settings cannot change the samples;
+- outputs smaller than one tile are restored on a padded 1024-pixel canvas and
+  cropped.
+
+Transformer evaluations at the default overlap (0.25):
+
+| Input | 1.0x | 1.2x | 1.5x | 1.75x | 2.0x | 2.5x | 3.0x | 4.0x |
+|---|---|---|---|---|---|---|---|---|
+| 1024² direct | 1 | 4 | 4 | 4 | 9 | 9 | 16 | 25 |
+| 1024² calibrated | 9 | 9 | 9 | 9 | 9 | 25 | 25 | 25 |
+| 2048² direct | 9 | 9 | 16 | 25 | 25 | 49 | 64 | 121 |
+| 2048² calibrated | 25 | 25 | 25 | 25 | 25 | 121 | 121 | 121 |
+| 4576² direct | 36 | 49 | 81 | 121 | 144 | 225 | 324 | 576 |
+| 4576² calibrated | 144 | 144 | 144 | 144 | 144 | 576 | 576 | 576 |
+
+(Calibrated uses the 2x family up to 2.0x and the 4x family above; direct
+counts do not depend on the family.) For example, a 4576×4576 input at 1.2x
+gives 5491×5491 from 49 tiles instead of 144. Per-tile work is the same in
+both modes, so restoration time scales roughly with the tile count; tile
+counts are quantised, so the saving shrinks towards the native factor.
+`python scripts/research_direct_fractional.py tiles --sizes ... --scales ...`
+prints exact counts for other sizes.
+
+### Memory
+
+Direct mode reuses the production tile loop: automatic tile batching,
+out-of-memory halving with transactional tile commits, cancellation between
+stages, CPU or GPU accumulation and the output assembly fallback. The blend
+buffer and the output are allocated at the requested size (12 bytes per output
+pixel each), never at the native size. The per-tile memory estimate adds the
+sampling buffers (input crop, row pass and tile in FP32); residual
+reconstruction adds one more tile.
+
+### Evidence
+
+All measurements below are CPU runs (bf16 weights, single-file checkpoint,
+FLUX.1 `ae.safetensors`); no GPU quality or speed qualification has been made
+for this mode. Clean references (six 1020×1020 portrait photographs, a
+510×510 photograph and a synthetic 1020×1020 text and pattern chart) were
+reduced by the scale with antialiased bicubic resampling and JPEG-compressed
+at quality 75 (unless noted), then restored back to the reference size with
+the 2x family. Metrics against the reference: PSNR over RGB, SSIM on luma,
+and high-frequency energy (mean absolute Laplacian of luma relative to the
+reference: 1.0 = as much fine detail as the reference, above 1 = sharper
+than it). Each restoration here is a single direct tile, so tile seams do
+not affect these numbers. `scripts/research_direct_fractional.py` reproduces the study on your own images
+(references at most 1024 px at the target size):
+
+```bash
+python scripts/research_direct_fractional.py tiles --sizes 1024 2048 4576
+python scripts/research_direct_fractional.py experiment --comfyui /path/to/ComfyUI \
+    --model models/diffusion_models/kandinsky_imagesr_2.0.safetensors --vae models/vae/ae.safetensors \
+    --images portrait.png chart.png --scales 1.2 1.5 --creativity 0 1 --jpeg 75 --out results/
+```
+
+Photographs at 1.2x, mean of 7 images, creativity 1 (t = 0.086):
+
+| Method | PSNR | SSIM | HF energy |
+|---|---|---|---|
+| Bicubic enlargement | 35.97 | 0.961 | 0.70 |
+| Calibrated 2x + resize | 32.44 | 0.920 | 1.47 |
+| VAE round trip (strength 0) | 34.44 | 0.954 | 0.71 |
+| Direct, strength 0.25 | 34.86 | 0.953 | 0.84 |
+| Direct, strength 0.5 | 34.34 | 0.943 | 1.04 |
+| Direct, strength 0.75 | 32.97 | 0.924 | 1.31 |
+| Direct, strength 1.0 | 31.12 | 0.893 | 1.68 |
+
+At creativity 0 (t = 0.07) the picture is the same, slightly shifted: direct
+0.5 gives 34.57 / 0.946 / 0.99, direct 1.0 32.00 / 0.909 / 1.49, calibrated
+32.97 / 0.929 / 1.35.
+
+Text chart at 1.2x, creativity 1: bicubic 19.90 / 0.902, calibrated 21.71 /
+0.949, direct 0.25 / 0.5 / 0.75 / 1.0: 21.09 / 0.931, 22.04 / 0.950,
+22.51 / 0.961, 22.17 / 0.962.
+
+Other conditions, creativity 1 (PSNR / SSIM / HF energy):
+
+| Condition | Calibrated | Direct 0.25 | Direct 0.5 | Direct 1.0 |
+|---|---|---|---|---|
+| 1.5x, 2 portraits | 30.08 / 0.873 / 1.53 | 33.66 / 0.933 / 0.72 | 33.03 / 0.922 / 0.93 | 29.50 / 0.854 / 1.68 |
+| 1.5x, text chart | 19.27 / 0.907 / 0.61 | 18.41 / 0.862 / 0.49 | 19.11 / 0.893 / 0.58 | 19.80 / 0.929 / 0.79 |
+| 1.0x, 1 portrait (JPEG only) | 34.45 / 0.952 / 1.27 | 34.50 / 0.956 / 1.06 | 33.65 / 0.942 / 1.27 | 30.26 / 0.886 / 1.95 |
+| 1.2x without JPEG, 2 portraits | 36.31 / 0.971 / 1.39 | 37.48 / 0.971 / 0.93 | 36.86 / 0.965 / 1.13 | 32.83 / 0.926 / 1.75 |
+
+Observations:
+
+- At full strength (1.0), direct restoration over-corrects: high-frequency
+  energy rises to 1.5–2x the reference, faces gain skin texture and hair
+  strokes that are not in the reference, and small text (10–14 px at 1.2x)
+  gets wrong glyphs ("Restoration" → "Rsibralon", "quick" → "qolck").
+  Calibrated restoration also over-sharpens these mildly degraded inputs (HF
+  1.3–1.5) and also garbles 10 px text, but less than direct 1.0.
+- Reducing the strength removes most of that. On the photographs, direct at
+  0.5 matches the reference's high-frequency energy at 1.2x (1.04) and 1.5x
+  (0.93), is 1.9 dB (1.2x) and 3.0 dB (1.5x) higher in PSNR than calibrated
+  restoration, and visually closest to the reference among the tested
+  restorations. At 1.0x (no enlargement), the reference's detail level is
+  reached at about 0.25.
+- Text prefers more correction: PSNR and SSIM on the chart rise up to 0.75–1.0,
+  but the glyph errors at 1.0 do not show in these metrics. At 0.5, 12 px and
+  larger text was legible at 1.2x; at 1.5x, 10–14 px text had letter errors in
+  every restored variant, including calibrated.
+- Bicubic enlargement has the highest PSNR/SSIM on the photographs in every
+  condition: the degradations are mild and any generative detail that differs
+  from the reference costs PSNR. The metrics measure fidelity to one
+  reference, not perceived quality.
+- Residual reconstruction made no consistent difference on JPEG inputs (at
+  0.5: +0.05 dB on the photographs, −0.08 dB on the chart at 1.2x; ±0.5 dB per
+  image). Without JPEG it was clearly better (2 portraits at 1.2x, strength
+  0.5: 38.93 / 0.983 against 36.86 / 0.965 latent), because the VAE round
+  trip itself loses more than the input degradation there (VAE only 36.72 dB,
+  bicubic 45.49 dB).
+- `production_check`: the node's direct path reproduced the experiment's
+  direct tiles exactly (maximum absolute difference 0).
+
+**Recommendation (provisional).** For direct restoration at about 1.2–1.5x,
+start with creativity 0–1 of the 2x family and `correction_strength` 0.5;
+near 1.0x use about 0.25; for text-heavy images try 0.5–0.75 and check small
+text. Consider `reconstruction = residual` for clean, uncompressed inputs.
+These values come from a small CPU study on one degradation model; they are
+not a calibration, and the widget default stays 1.0 so that existing
+workflows and calibrated restoration are unchanged. Use calibrated mode when
+you want the officially calibrated behaviour.
+
+### Earlier experiment (full strength only)
+
+Before `correction_strength` existed, a prototype compared direct
+restoration at full strength with calibrated restoration on one composite
+420×1260 image (portrait, text chart, photograph; JPEG 75, creativity 1;
+tiles sampled from the whole image). Direct was below
+calibrated in PSNR/SSIM at every scale (1.2x: 24.70 / 0.887 against 25.90 /
+0.926; 1.5x: 23.87 / 0.872 against 24.09 / 0.889), over-sharpened faces and
+invented glyphs, and the deficit grew with creativity (SSIM at 1.2x, creativity
+0 / 2 / 4: 0.896 / 0.865 / 0.847 direct against 0.929 / 0.920 / 0.913
+calibrated). That result is consistent with the full-strength rows above.
+The strength sweep changed the assessment: with the geometry unchanged, reducing
+only the size of the applied correction removed most of the deficit.
 
 ## Creativity
 
@@ -366,8 +583,16 @@ In `example_workflows/` (drag into ComfyUI):
   resize, next to a plain bicubic 1.2x enlargement and the original. The
   built-in resize avoids repeating the restoration; it is close to, but not
   bit-identical with, what `output_scale` produces.
+- `08_Direct_Fractional_Restoration.json` – experimental direct 1.2x
+  restoration with the 2x family, creativity 1 and correction strength 0.5
+  (the provisional starting point from the CPU study).
+- `09_Direct_Fractional_Comparison.json` – the original, a bicubic 1.2x
+  enlargement, calibrated 2x restoration resized to 1.2x, and direct 1.2x
+  restoration at correction strength 1.0 and 0.5 (creativity 1), each saved
+  with mode, scale, family, creativity and strength in the file name. Each
+  restoration runs separately.
 
-Workflows 01–04, 06 and 07 use the single-file checkpoint with
+Workflows 01–04 and 06–09 use the single-file checkpoint with
 `ae.safetensors` from Load VAE.
 
 ## Testing and reference qualification
@@ -442,96 +667,6 @@ precision, which brings those backends to within 0.25 % of SDPA (from 2–3 %).
 Backends with their own quantization (e.g. SageAttention) are used as
 configured and are not qualified.
 
-## Direct fractional restoration (research)
-
-`output_scale` always restores at a calibrated native scale. A faster
-alternative would be to restore directly at the requested scale: enlarge the
-input by, say, 1.2x instead of 2x, so each 1024-pixel tile covers more of the
-input and fewer transformer evaluations are needed. This is **not** offered by
-the node. `scripts/research_direct_fractional.py` is an isolated prototype for
-studying it.
-
-**What the model receives.** The transformer sees only the VAE latent of the
-bicubic-enlarged tile and one of its baked timesteps. There is no scale or
-degradation input; the two calibrated tables (2x: 0.07–0.30, 4x: 0.17–0.38) do
-not share any timestep, so the scale is implied only by the choice of timestep
-and by how blurred the enlarged input looks. A 1.2x enlargement is much sharper
-than a 2x one, so its latent plausibly lies outside what the 2x calibration was
-made for. The prototype reuses the 2x creativity timesteps for scales between
-1x and 2x; no calibration exists for this.
-
-**Geometry.** Tiles are placed in output pixels with the official rule
-(1024-pixel tiles, stride `int(1024 × (1 − overlap))`, last tile aligned to the
-edge, boundary-aware Hann windows); every output pixel centre `o` maps to the
-input coordinate `(o + 0.5) × in / out − 0.5`, and each tile is sampled from
-the whole image (bicubic, border taps clamped), so overlapping tiles share one
-global mapping. Tests establish positive blend weight for every pixel,
-equality with the native tile placement at 2x, seam-free reconstruction with an
-identity model, and bit-identical delegation to the native pipeline at exact
-2x/4x.
-
-**Experiment** (CPU, bf16, single-file checkpoint and `ae.safetensors`): a
-420×1260 reference (a public-domain portrait, a synthetic text and pattern
-chart, a CC0 photograph) was reduced by each scale with antialiased bicubic
-resampling and JPEG-compressed (quality 75); each method then produced the
-reference size. PSNR (over RGB) / SSIM (on luma) against the reference,
-creativity 1 (t = 0.086):
-
-| Scale | Bicubic | Native 2x + resize | Direct | Tiles native / direct |
-|---|---|---|---|---|
-| 1.0 | 30.92 / 0.963 | 28.41 / 0.951 | 24.32 / 0.880 | 3 / 2 |
-| 1.2 | 24.44 / 0.925 | 25.90 / 0.926 | 24.70 / 0.887 | 3 / 2 |
-| 1.5 | 22.41 / 0.881 | 24.09 / 0.889 | 23.87 / 0.872 | 2 / 2 |
-| 1.75 | 21.30 / 0.850 | 23.05 / 0.867 | 22.89 / 0.855 | 2 / 2 |
-| 2.0 | 20.38 / 0.815 | 20.90 / 0.827 | (= native) | 2 / 2 |
-
-At creativity 0, 2 and 4 the ordering is the same at every scale, and the
-direct path loses more as creativity rises (at 1.2x: SSIM 0.896 / 0.865 / 0.847
-direct versus 0.929 / 0.920 / 0.913 native). Visually, direct restoration
-over-sharpens faces and raises contrast, and it invents glyph shapes in small
-text ("Restoration" rendered as "Raslorallon", "13px" as "18px") where native
-2x + resize stays faithful. At 1.0x neither restoration beats the JPEG input in
-PSNR: the restoration changes pixels in ways PSNR penalises. The picture is not
-uniformly negative for the direct path: at 1.2x it still exceeds bicubic in
-PSNR while falling below it in SSIM, and its deficit shrinks to 0.2 dB at 1.5x
-and 1.75x. No step discontinuities were found at the tile window boundaries.
-
-These results compare two complete pipelines on one composite image with one
-degradation; they do not isolate a cause. The pipelines differ in the
-enlargement fed to the transformer, the source area per tile, tile-local versus
-global bicubic sampling, and the antialiased reduction after native
-restoration, which by itself suppresses generated high-frequency texture. A
-timestep that is too strong for the milder enlargement is one plausible
-explanation consistent with the results, not an established one. The exact
-2x/4x control cases delegate to the native pipeline, so they do not show how
-the direct path behaves as the scale approaches 2x; the identity-model tests
-establish geometry and blending only, not equivalence of restoration
-behaviour. The script's timings are exploratory (the native arm runs the full
-node runtime, the direct arm only the tile loop, without warm-up or repeated
-measurements) and are not a speed comparison.
-
-**Cost.** With the implemented placement, a 2048² input needs 9 transformer
-evaluations directly at 1.0x or 1.2x, 16 at 1.5x and 25 at 1.75x, against 25 for
-native 2x (1024²: 1, 4, 4, 4 against 9). The saving disappears towards 2x
-because tile counts are quantised. Per-tile cost is the same, so time scales
-with the tile count; this has not been measured on a GPU.
-
-**Conclusion.** On this evidence direct fractional restoration needs fewer
-transformer evaluations but was less faithful on the tested image, so the node
-keeps the native restoration followed by a resize. A broader benchmark (more
-images and degradations) would be needed for a general verdict. The prototype remains available for experiments on other images or
-with other timestep choices (`--timestep-table 4` reuses the 4x values):
-
-```bash
-python scripts/research_direct_fractional.py tiles --sizes 1024 2048
-python scripts/research_direct_fractional.py experiment --comfyui /path/to/ComfyUI \
-    --model models/diffusion_models/kandinsky_imagesr_2.0.safetensors --vae models/vae/ae.safetensors \
-    --images reference.png --scales 1.0 1.2 1.5 1.75 2.0 --creativity 0 1 2 4 --jpeg 75 --out results/
-```
-
-The reference image's dimensions must be reachable from an integer size at
-every scale (420 works for 1.0/1.2/1.5/1.75/2.0).
-
 ## Troubleshooting
 
 - **The loader shows "(no Kandinsky ImageSR checkpoint found)"**: put
@@ -561,14 +696,25 @@ every scale (420 works for 1.0/1.2/1.5/1.75/2.0).
 - **Colours differ from the official command line tool**: ComfyUI's Load Image
   node does not convert embedded ICC colour profiles to sRGB, the official tool
   does. Convert such images to sRGB beforehand.
+- **"correction_strength must lie in [0, 1]"**: use a value from 0 (VAE round
+  trip only) to 1 (official correction).
+- **"output_scale must not exceed 4.0"** in direct mode: direct restoration
+  supports 1.0–4.0.
+- **Direct restoration looks over-sharpened, or small text changes**: lower
+  `correction_strength` (0.5 is a reasonable start at 1.2–1.5x) or
+  `creativity`, or use the calibrated mode.
 - **Visible change of faces or text**: lower `creativity`.
 
 ## Known limitations
 
-- Only the published 2x/4x tile geometry and the 18 calibrated timesteps are
-  supported; arbitrary strengths would require timesteps that are not baked into
-  the checkpoint. Other output sizes come from resizing a native restoration
-  (`output_scale`) and cost a full native restoration.
+- Only the 18 calibrated timesteps can condition the model; arbitrary
+  timesteps are not baked into the checkpoint. In the default calibrated mode
+  other output sizes come from resizing a native restoration and cost a full
+  native restoration.
+- Direct fractional restoration is uncalibrated: its timesteps and the
+  recommended correction strengths come from a small CPU study with one
+  degradation model (bicubic reduction plus JPEG), not from training or an
+  official calibration. Its speed has not been measured on a GPU.
 - Quantized (FP8/INT8) and FP16 execution and `torch.compile` are not
   implemented.
 - The transformer is managed by ComfyUI's standard `ModelPatcher`, also when
@@ -580,10 +726,10 @@ every scale (420 works for 1.0/1.2/1.5/1.75/2.0).
   supported.
 - Combined single-file checkpoints with a bundled VAE (`transformer.`/`vae.`
   tensor prefixes) are not supported; use the transformer-only file.
-- Visual quality has only been spot-checked on a few public-domain photographs;
-  GPU performance has not been measured by this project. Use
-  `04_Qualification_Grid.json` and `scripts/benchmark.py` on your own data and
-  hardware.
+- Visual quality has been evaluated only on a small set of photographs and a
+  synthetic text chart, on CPU; GPU performance has not been measured by this
+  project. Use `04_Qualification_Grid.json`, `09_Direct_Fractional_Comparison.json`
+  and `scripts/benchmark.py` on your own data and hardware.
 
 ## Attribution and licenses
 

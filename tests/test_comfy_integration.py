@@ -449,6 +449,61 @@ def test_fractional_comparison_workflow_restores_once(env, io_dirs, monkeypatch)
     }
 
 
+def test_direct_fractional_workflow_executes(env, io_dirs, monkeypatch):
+    """08: direct 1.2x restoration of the 30x24 example image -> 36x29 with a direct tile plan."""
+    from PIL import Image
+
+    runtime = env["module"]("runtime")
+    direct = env["module"]("direct")
+    restorers = []
+    real_run = runtime.TiledRestorer.run
+    monkeypatch.setattr(
+        runtime.TiledRestorer, "run", lambda self, i, o: restorers.append((type(self), o)) or real_run(self, i, o)
+    )
+    wf = json.loads((ROOT / "example_workflows" / "08_Direct_Fractional_Restoration.json").read_text())
+    up = next(n for n in wf["nodes"] if n["type"] == "KandinskyImageSRUpscale")
+    assert up["widgets_values"] == ["2x", 1, 0.25, 0, "auto", 1.2, "direct_fractional", 0.5, "latent"]
+    _execute_workflow(ROOT / "example_workflows" / "08_Direct_Fractional_Restoration.json")
+    assert [(cls, o.correction_strength, o.residual) for cls, o in restorers] == [(direct.DirectRestorer, 0.5, False)]
+    saved = sorted((io_dirs / "output" / "kandinsky_sr").glob("direct1.2x_fam2x_c1_cs0.5_*.png"))
+    assert saved and Image.open(saved[-1]).size == (36, 29)
+
+
+def test_direct_fractional_comparison_workflow_executes(env, io_dirs, monkeypatch):
+    """09: calibrated and two direct restorations, all at 1.2x, next to bicubic and the original."""
+    from PIL import Image
+
+    runtime = env["module"]("runtime")
+    direct = env["module"]("direct")
+    restorers = []
+    real_run = runtime.TiledRestorer.run
+    monkeypatch.setattr(
+        runtime.TiledRestorer, "run", lambda self, i, o: restorers.append((type(self), o)) or real_run(self, i, o)
+    )
+    _execute_workflow(ROOT / "example_workflows" / "09_Direct_Fractional_Comparison.json")
+    assert sorted((cls.__name__, o.correction_strength) for cls, o in restorers) == sorted(
+        [("TiledRestorer", 1.0), (direct.DirectRestorer.__name__, 1.0), (direct.DirectRestorer.__name__, 0.5)]
+    )
+    out = io_dirs / "output" / "kandinsky_sr"
+    sizes = {
+        prefix: Image.open(sorted(out.glob(f"{prefix}_*.png"))[-1]).size
+        for prefix in (
+            "cmp_original",
+            "cmp_bicubic_out1.2x",
+            "cmp_calibrated2x_c1_cs1.0_out1.2x",
+            "cmp_direct1.2x_fam2x_c1_cs1.0",
+            "cmp_direct1.2x_fam2x_c1_cs0.5",
+        )
+    }
+    assert sizes == {
+        "cmp_original": (30, 24),
+        "cmp_bicubic_out1.2x": (36, 29),
+        "cmp_calibrated2x_c1_cs1.0_out1.2x": (36, 29),
+        "cmp_direct1.2x_fam2x_c1_cs1.0": (36, 29),
+        "cmp_direct1.2x_fam2x_c1_cs0.5": (36, 29),
+    }
+
+
 def test_api_prompt_without_output_scale_validates_and_runs(env, io_dirs):
     """API-format prompts written before output_scale existed omit the input entirely."""
     import execution
