@@ -141,7 +141,14 @@ def test_node_registration_and_schema(env):
     # accepts the legacy type name so saved links stay valid
     assert req["sr_model"][0] == "KANDINSKY_IMAGESR_MODEL,KANDINSKY_SR_MODEL" and req["image"][0] == "IMAGE"
     optional = up["input"]["optional"]
-    assert list(optional) == ["vae", "output_scale"] and optional["vae"][0] == "VAE"
+    assert list(optional) == [
+        "vae",
+        "output_scale",
+        "restoration_mode",
+        "correction_strength",
+        "reconstruction",
+    ]
+    assert optional["vae"][0] == "VAE"
     # new widget: optional, appended after the existing widgets, default = native size
     assert optional["output_scale"][0] == "FLOAT"
     assert {k: optional["output_scale"][1][k] for k in ("default", "min", "max", "step")} == {
