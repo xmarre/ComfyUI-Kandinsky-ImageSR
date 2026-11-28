@@ -1,0 +1,28 @@
+{
+  "_class_name": "KandinskyImageSRPipeline",
+  "_diffusers_version": "0.41.0",
+  "transformer": [
+    "kandinsky_image_sr",
+    "KandinskyImageSRBakedTransformer3DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKL"
+  ],
+  "upscale_factors": [
+    2,
+    4
+  ],
+  "one_step_t_by_factor": {
+    "2": 0.15,
+    "4": 0.244
+  },
+  "tile_size": 1024,
+  "overlap": 0.25,
+  "text_sequence_length": 4,
+  "scale_factor": [
+    1.0,
+    1.0,
+    1.0
+  ]
+}

@@ -1,0 +1,35 @@
+[project]
+name = "comfyui-kandinsky-imagesr"
+version = "1.0.0"
+description = "Native ComfyUI nodes for Kandinsky ImageSR 2.0 one-step 2x/4x super-resolution and image restoration."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+# Runtime dependencies are those of ComfyUI itself (torch, safetensors, numpy);
+# nothing else is required.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/xmarre/ComfyUI-Kandinsky-ImageSR"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-Kandinsky-ImageSR/issues"
+
+[tool.comfy]
+PublisherId = "xmarre"
+DisplayName = "Kandinsky ImageSR"
+includes = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--import-mode=importlib -ra"
+markers = [
+    "real_model: requires the full Kandinsky-ImageSR-2.0 bundle (set KANDINSKY_SR_BUNDLE)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B905", "UP038"]
