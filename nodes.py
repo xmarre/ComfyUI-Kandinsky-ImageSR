@@ -12,6 +12,8 @@ from .kandinsky_sr import config as cfg
 from .kandinsky_sr.loader import discover_bundles, is_single_file_checkpoint
 from .kandinsky_sr.runtime import (
     ACCUMULATION_MODES,
+    RECONSTRUCTIONS,
+    RESTORATION_MODES,
     VAE_DTYPES,
     WEIGHT_DTYPES,
     KandinskySRModel,
@@ -231,7 +233,46 @@ class KandinskyImageSRUpscale(io.ComfyNode):
                         "native restoration scale (e.g. 1.0 = restore without enlarging, 1.2 = 1.2x): the image is "
                         "restored at the native scale and the finished result is resized with antialiased bicubic "
                         "resampling to round(input size x output_scale). Restoration cost and creativity behaviour "
-                        "are those of the native scale. Values above 2 require the 4x native scale."
+                        "are those of the native scale. Values above 2 require the 4x native scale. In "
+                        "direct_fractional mode it instead sets the size the model restores at directly (1.0-4.0)."
+                    ),
+                ),
+                io.Combo.Input(
+                    "restoration_mode",
+                    options=list(RESTORATION_MODES),
+                    default="calibrated",
+                    optional=True,
+                    tooltip=(
+                        "calibrated: restore at the native 2x/4x scale the model was calibrated for, then resize to "
+                        "output_scale (full native cost). direct_fractional (experimental, uncalibrated): restore "
+                        "directly at output_scale, so the number of model evaluations follows the requested size "
+                        "(e.g. 49 instead of 144 tiles for 4576 px at 1.2x); the native restoration scale only "
+                        "selects which calibrated timesteps are reused."
+                    ),
+                ),
+                io.Float.Input(
+                    "correction_strength",
+                    default=1.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    optional=True,
+                    tooltip=(
+                        "Multiplier of the model's correction: z - strength * t * v. The model is still conditioned "
+                        "on the creativity timestep t; only the size of the applied update changes. 1.0 = the "
+                        "official full correction. 0 skips the model entirely (VAE round trip only). Lower values "
+                        "are mainly useful with direct_fractional restoration."
+                    ),
+                ),
+                io.Combo.Input(
+                    "reconstruction",
+                    options=list(RECONSTRUCTIONS),
+                    default="latent",
+                    optional=True,
+                    tooltip=(
+                        "latent: decode the corrected latent (official). residual: add only the decoded effect of "
+                        "the correction to the bicubic input, decode(z_sr) - decode(z_lq), which cancels the VAE's "
+                        "own reconstruction loss; costs one extra VAE decode per tile."
                     ),
                 ),
             ],
@@ -250,6 +291,9 @@ class KandinskyImageSRUpscale(io.ComfyNode):
         accumulation_device: str,
         vae=None,
         output_scale: float = 0.0,
+        restoration_mode: str = "calibrated",
+        correction_strength: float = 1.0,
+        reconstruction: str = "latent",
     ) -> io.NodeOutput:
         if not isinstance(sr_model, KandinskySRModel):
             origin = type(sr_model).__module__
@@ -270,6 +314,9 @@ class KandinskyImageSRUpscale(io.ComfyNode):
             accumulation_device=accumulation_device,
             vae=vae,
             output_scale=output_scale,
+            restoration_mode=restoration_mode,
+            correction_strength=correction_strength,
+            reconstruction=reconstruction,
         )
         return io.NodeOutput(output)
 
