@@ -68,6 +68,12 @@ class RunOptions:
     progress: Callable[[int], None] | None = None
     #: Called with the failed batch size after an OOM; may free memory (e.g. caches).
     on_oom: Callable[[int], None] | None = None
+    #: Multiplier of the flow update: ``z - correction_strength * timestep * v``. The
+    #: transformer is still conditioned on ``timestep``; 0 skips the transformer.
+    correction_strength: float = 1.0
+    #: Pixel-space residual reconstruction: ``tile + decode(z_sr) - decode(z_lq)``
+    #: instead of ``decode(z_sr)`` (one more VAE decode per tile; clamped after blending).
+    residual: bool = False
 
 
 @dataclass
@@ -81,6 +87,8 @@ class RunStats:
     output_size: tuple[int, int] | None = None
     #: True when assembling the final output ran out of device memory and finished in system memory.
     assembly_fallback: bool = False
+    #: Tiles that went through the transformer (0 when the correction strength is 0).
+    transformer_evaluations: int = 0
 
 
 class _Accumulator:
@@ -98,6 +106,7 @@ class TiledRestorer:
         self.backend = backend
         self.grid = grid
         self._windows: dict[tuple[torch.device, bool, bool, bool, bool], torch.Tensor] = {}
+        self._clamp_output = False
 
     # ------------------------------------------------------------------ helpers
 
@@ -138,26 +147,46 @@ class TiledRestorer:
             tiles.append(tile)
         return torch.cat(tiles)
 
-    def _infer(self, images: torch.Tensor, units: list[tuple[int, int, int]], opts: RunOptions) -> torch.Tensor:
-        backend = self.backend
-        device = backend.compute_device
+    def _model_pixels(self, images: torch.Tensor, units: list[tuple[int, int, int]], device) -> torch.Tensor:
+        """Model-space input tiles ``(N, 3, T, T)``: the bicubic enlargement of each input tile."""
         g = self.grid
         lq = self._lq_tiles(images, units, device)
         pixels = F.interpolate(lq, size=(g.tile_size, g.tile_size), mode="bicubic", align_corners=False)
         del lq
-        pixels = pixels.clamp_(0.0, 1.0)
+        return pixels.clamp_(0.0, 1.0)
+
+    def _infer(self, images: torch.Tensor, units: list[tuple[int, int, int]], opts: RunOptions) -> torch.Tensor:
+        backend = self.backend
+        device = backend.compute_device
+        pixels = self._model_pixels(images, units, device)
         if not pixels.is_contiguous():
             raise RuntimeError("internal error: VAE input must be NCHW-contiguous")
         self._check_interrupt(opts)
         latents = backend.encode(pixels)
-        del pixels
+        if not opts.residual:
+            del pixels
         self._check_interrupt(opts)
-        velocity = backend.transform(latents, opts.timestep_index)
-        corrected = latents - opts.timestep * velocity
-        del latents, velocity
+        strength = opts.correction_strength
+        if strength == 0.0:
+            corrected = latents  # no correction: the transformer is not evaluated
+        else:
+            velocity = backend.transform(latents, opts.timestep_index)
+            coefficient = opts.timestep if strength == 1.0 else strength * opts.timestep
+            corrected = latents - coefficient * velocity
+            del velocity
+        if not opts.residual:
+            del latents
         self._check_interrupt(opts)
         decoded = backend.decode(corrected)
         del corrected
+        if opts.residual:
+            # Only the decoded effect of the correction is added to the sampled input,
+            # so the VAE's own reconstruction loss cancels; clamped after blending.
+            self._check_interrupt(opts)
+            baseline = backend.decode(latents)
+            del latents
+            decoded = decoded.sub_(baseline).add_(pixels)
+            del baseline, pixels
         return decoded
 
     @staticmethod
@@ -185,6 +214,7 @@ class TiledRestorer:
         position = 0
         acc_device = opts.accumulation_device
         prepared = None
+        self._clamp_output = opts.residual
 
         try:
             while position < len(queue):
@@ -212,6 +242,8 @@ class TiledRestorer:
                 position += len(units)
                 stats.batches += 1
                 stats.tiles += len(units)
+                if opts.correction_strength != 0.0:
+                    stats.transformer_evaluations += len(units)
                 stats.batch_sizes.append(len(units))
                 stats.final_batch_size = batch_size
                 if opts.progress is not None:
@@ -312,6 +344,8 @@ class TiledRestorer:
             stop = min(start + _FINALIZE_ROWS, g.out_height)
             weight = wy[start:stop].to(device)[:, None] * wx_dev[None, :]
             rows = buffer[:, start:stop, : g.out_width] / weight
+            if self._clamp_output:
+                rows.clamp_(0.0, 1.0)
             out[start:stop].copy_(rows.permute(1, 2, 0))
 
 

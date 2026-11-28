@@ -34,12 +34,14 @@ _QUANTUM = Decimal("0.000001")
 ENDPOINT_TOLERANCE = 1e-9
 
 
-def validate_output_scale(output_scale: object, upscale_factor: int) -> Decimal | None:
+def validate_output_scale(output_scale: object, upscale_factor: int, max_scale: float | None = None) -> Decimal | None:
     """The requested scale as a decimal, or ``None`` for the native output size.
 
     Raises ``ValueError`` for anything that is not ``0`` or a finite number in
-    ``[1, upscale_factor]``. Nothing is clamped or substituted.
+    ``[1, max_scale]`` (``max_scale`` defaults to ``upscale_factor``). Nothing is
+    clamped or substituted.
     """
+    limit = upscale_factor if max_scale is None else max_scale
     if isinstance(output_scale, bool) or not isinstance(output_scale, (int, float)):
         raise ValueError(f"output_scale must be a number, got {type(output_scale).__name__} {output_scale!r}")
     value = float(output_scale)
@@ -56,13 +58,13 @@ def validate_output_scale(output_scale: object, upscale_factor: int) -> Decimal 
         )
     if value > MAX_OUTPUT_SCALE + ENDPOINT_TOLERANCE:
         raise ValueError(f"output_scale must not exceed {MAX_OUTPUT_SCALE}, got {output_scale!r}")
-    if value > upscale_factor + ENDPOINT_TOLERANCE:
+    if value > limit + ENDPOINT_TOLERANCE:
         raise ValueError(
             f"output_scale {output_scale!r} exceeds the native restoration scale {upscale_factor}x; select the "
             "4x upscale_factor for output scales above 2"
         )
     scale = Decimal(repr(value)).quantize(_QUANTUM, rounding=ROUND_HALF_UP)
-    return min(max(scale, Decimal(MIN_OUTPUT_SCALE)), Decimal(upscale_factor))  # only endpoint noise moves
+    return min(max(scale, Decimal(MIN_OUTPUT_SCALE)), Decimal(repr(float(limit))))  # only endpoint noise moves
 
 
 def scaled_length(length: int, scale: Decimal) -> int:

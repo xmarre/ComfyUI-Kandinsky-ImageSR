@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from . import config as cfg
+from .direct import DirectGrid, DirectRestorer, plan_grid
 from .loader import BundleInfo, inspect_checkpoint, load_transformer_state_dict, validate_tables
 from .memory import (
     TileMemoryEstimate,
@@ -25,12 +27,14 @@ from .memory import (
 )
 from .model import KandinskyImageSRTransformer, build_rope, comfy_attention, comfy_operations
 from .pipeline import RunOptions, RunStats, TiledRestorer
-from .resize import resize_rgb, target_size, validate_output_scale
+from .resize import MAX_OUTPUT_SCALE, resize_rgb, target_size, validate_output_scale
 from .tiling import make_grid
 from .vae import ImageSRVAE, validate_imagesr_vae
 
 logger = logging.getLogger(__name__)
 
+RESTORATION_MODES = ("calibrated", "direct_fractional")
+RECONSTRUCTIONS = ("latent", "residual")
 WEIGHT_DTYPES = ("default", "bf16", "fp32")
 VAE_DTYPES = ("default", "bf16", "fp32")
 ACCUMULATION_MODES = ("auto", "cpu", "gpu")
@@ -252,6 +256,9 @@ def upscale(
     accumulation_device: str = "auto",
     vae: object | None = None,
     output_scale: float = 0.0,
+    restoration_mode: str = "calibrated",
+    correction_strength: float = 1.0,
+    reconstruction: str = "latent",
 ) -> tuple[torch.Tensor, RunStats]:
     """Super-resolve a ComfyUI IMAGE batch. ``tile_batch_size=0`` selects automatically.
 
@@ -261,6 +268,16 @@ def upscale(
     otherwise the restored image is resized to ``round_half_up(input *
     output_scale)`` (see :mod:`.resize`), with ``1 <= output_scale <=
     upscale_factor``.
+
+    ``restoration_mode="direct_fractional"`` instead restores directly at the
+    requested size (``1 <= output_scale <= 4``; see :mod:`.direct`), using the
+    timesteps of the ``upscale_factor`` calibration family. Exactly the family's
+    native size uses the native grid.
+
+    ``correction_strength`` scales the flow update, ``z - s * t * v``, while the
+    transformer stays conditioned on ``t``; 0 skips the transformer (VAE round
+    trip only). ``reconstruction="residual"`` returns ``tile + decode(z_sr) -
+    decode(z_lq)`` (an extra VAE decode per tile) instead of ``decode(z_sr)``.
     """
     import comfy.model_management as mm
     import comfy.utils
@@ -268,7 +285,13 @@ def upscale(
     validate_image(image)
     timestep = cfg.resolve_timestep(upscale_factor, creativity)
     index = model.config.timestep_index(timestep)
-    scale = validate_output_scale(output_scale, upscale_factor)
+    if restoration_mode not in RESTORATION_MODES:
+        raise ValueError(f"restoration_mode must be one of {RESTORATION_MODES}, got {restoration_mode!r}")
+    if reconstruction not in RECONSTRUCTIONS:
+        raise ValueError(f"reconstruction must be one of {RECONSTRUCTIONS}, got {reconstruction!r}")
+    strength = validate_correction_strength(correction_strength)
+    direct = restoration_mode == "direct_fractional"
+    scale = validate_output_scale(output_scale, upscale_factor, MAX_OUTPUT_SCALE if direct else None)
     if isinstance(tile_batch_size, bool) or not isinstance(tile_batch_size, int) or tile_batch_size < 0:
         raise ValueError(f"tile_batch_size must be 0 (auto) or a positive integer, got {tile_batch_size!r}")
     if accumulation_device not in ACCUMULATION_MODES:
@@ -277,15 +300,22 @@ def upscale(
     batch, height, width, channels = image.shape
     alpha = image[..., 3:4] if channels == 4 else None
     rgb = image[..., :3]
-    grid = make_grid(height, width, upscale_factor, model.config.tile_size, overlap)
-    total_tiles = batch * grid.num_tiles
     final_size = target_size(height, width, scale, upscale_factor)
-    # Exactly the native size (also when a fractional scale rounds to it): no resize at all.
+    if direct:
+        grid = plan_grid(height, width, final_size, upscale_factor, model.config.tile_size, overlap)
+    else:
+        grid = make_grid(height, width, upscale_factor, model.config.tile_size, overlap)
+    total_tiles = batch * grid.num_tiles
+    # Exactly the restored size (also when a fractional scale rounds to it): no resize at all.
     resize = final_size != (grid.out_height, grid.out_width)
 
     vae = resolve_vae(model, vae)
     estimate = estimate_tile_memory(model, vae)
     per_tile = estimate.per_tile
+    if isinstance(grid, DirectGrid):
+        per_tile += grid.sample_bytes()
+    if reconstruction == "residual":
+        per_tile += 2 * 3 * 4 * grid.tile_size**2  # sampled tile and second decode kept together
     acc_bytes = grid.accumulation_bytes()
 
     def live_accumulator_bytes(tiles: int) -> int:
@@ -305,7 +335,9 @@ def upscale(
     requested = min(tile_batch_size, total_tiles) if tile_batch_size > 0 else 1
     gpu_acc = live_accumulator_bytes(requested) if accumulation_device == "gpu" else 0
     working = max(requested * per_tile + gpu_acc, resize_bytes)
-    mm.load_models_gpu([model.patcher, vae.patcher], memory_required=working + output_bytes)
+    # With no correction the transformer is never evaluated, so it is not loaded.
+    patchers = [vae.patcher] if strength == 0.0 else [model.patcher, vae.patcher]
+    mm.load_models_gpu(patchers, memory_required=working + output_bytes)
 
     reserved = mm.extra_reserved_memory() if hasattr(mm, "extra_reserved_memory") else 0
     free = mm.get_free_memory(device) - output_bytes if device.type != "cpu" else 0
@@ -319,21 +351,35 @@ def upscale(
     acc_device = choose_accumulation_device(
         accumulation_device, device, live_accumulator_bytes(batch_size), free - reserved - batch_size * per_tile
     )
+    correction = (
+        f"correction strength {strength:g}, applied flow coefficient {strength * timestep:g}"
+        + (", residual reconstruction" if reconstruction == "residual" else "")
+        + (" (no transformer evaluation)" if strength == 0.0 else "")
+    )
+    if isinstance(grid, DirectGrid):
+        restoration = (
+            f"direct fractional restoration at {scale.normalize()}x (uncalibrated; {upscale_factor}x calibration "
+            f"family, creativity {creativity}, conditioning timestep {timestep}, {correction})"
+        )
+    else:
+        restoration = (
+            f"native restoration ({upscale_factor}x, creativity {creativity}, t={timestep}"
+            + ("" if strength == 1.0 and reconstruction == "latent" else f", {correction}")
+            + ")"
+        )
     if resize:
         final = f"final output {final_size[1]}x{final_size[0]} ({scale.normalize()}x, antialiased bicubic resize)"
     else:
-        final = "final output at native size"
+        final = "no final resize"
     logger.info(
-        "Kandinsky ImageSR: %d image(s) %dx%d -> %dx%d native restoration (%dx, creativity %d, t=%s), %s; "
+        "Kandinsky ImageSR: %d image(s) %dx%d -> %dx%d %s, %s; "
         "%d tiles (%dx%d grid), tile batch %d (~%s per tile), accumulator %s on %s",
         batch,
         width,
         height,
         grid.out_width,
         grid.out_height,
-        upscale_factor,
-        creativity,
-        timestep,
+        restoration,
         final,
         total_tiles,
         grid.cols,
@@ -354,11 +400,14 @@ def upscale(
         interrupt=mm.throw_exception_if_processing_interrupted,
         progress=pbar.update,
         on_oom=lambda _size: mm.soft_empty_cache(),
+        correction_strength=strength,
+        residual=reconstruction == "residual",
     )
     rope = build_rope(model.config, device)
     try:
         with torch.no_grad():
-            output, stats = TiledRestorer(_ComfyBackend(model, vae, rope), grid).run(rgb, options)
+            restorer = DirectRestorer if isinstance(grid, DirectGrid) else TiledRestorer
+            output, stats = restorer(_ComfyBackend(model, vae, rope), grid).run(rgb, options)
     finally:
         del rope
 
@@ -389,6 +438,16 @@ def upscale(
         traceback.clear_frames(error.__traceback__)
         raise
     return final, stats
+
+
+def validate_correction_strength(value: object) -> float:
+    """A finite number in [0, 1]; nothing is clamped."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"correction_strength must be a number, got {type(value).__name__} {value!r}")
+    strength = float(value)
+    if not math.isfinite(strength) or not 0.0 <= strength <= 1.0:
+        raise ValueError(f"correction_strength must lie in [0, 1], got {value!r}")
+    return strength
 
 
 def _same_device(a: torch.device, b: torch.device) -> bool:

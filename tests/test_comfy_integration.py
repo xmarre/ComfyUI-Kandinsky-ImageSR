@@ -872,8 +872,13 @@ def test_runtime_signature_is_backward_compatible(env):
         "accumulation_device",
         "vae",
         "output_scale",
+        "restoration_mode",
+        "correction_strength",
+        "reconstruction",
     ]
-    assert inspect.signature(runtime.upscale).parameters["output_scale"].default == 0.0
+    defaults = {k: v.default for k, v in inspect.signature(runtime.upscale).parameters.items()}
+    assert defaults["output_scale"] == 0.0 and defaults["restoration_mode"] == "calibrated"
+    assert defaults["correction_strength"] == 1.0 and defaults["reconstruction"] == "latent"
     model = _load(env)
     image = _image()
     positional, stats = runtime.upscale(model, image, 2, 4, 0.25, 0, "auto", None)
