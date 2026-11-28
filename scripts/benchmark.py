@@ -103,7 +103,17 @@ def main() -> None:
     parser.add_argument("--weight-dtype", default="bf16", choices=["default", "bf16", "fp32"])
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3, help="measured repetitions (at least 1)")
-    parser.add_argument("--stages", action="store_true", help="time encode/transformer/decode (adds syncs)")
+    parser.add_argument(
+        "--restoration-modes", nargs="+", default=["calibrated"], choices=["calibrated", "direct_fractional"]
+    )
+    parser.add_argument("--correction-strengths", type=float, nargs="+", default=[1.0])
+    parser.add_argument("--reconstructions", nargs="+", default=["latent"], choices=["latent", "residual"])
+    parser.add_argument(
+        "--stages",
+        action="store_true",
+        help="time input sampling, encode, transformer, decode, accumulation and output assembly "
+        "(adds device synchronisation; use separate runs without it for throughput)",
+    )
     parser.add_argument("--json", help="write results as JSON")
     parser.add_argument("--comfy-args", nargs=argparse.REMAINDER, default=[])
     args = parser.parse_args()
@@ -140,34 +150,38 @@ def main() -> None:
         f"{to_device_seconds:.2f}s to {device} ({type(model.patcher).__name__})"
     )
 
-    stage_times: dict[str, list[float]] = {"encode": [], "transform": [], "decode": []}
-    if args.stages and any(scale for scale in args.output_scales):
-        stage_times["final_resize"] = []
-        original_resize = runtime._finish_resized
+    from kandinsky_sr.direct import DirectRestorer
+    from kandinsky_sr.pipeline import TiledRestorer
 
-        def timed_resize(*a, **kw):
+    stage_times: dict[str, list[float]] = {"encode": [], "transform": [], "decode": []}
+
+    def instrument(owner, attribute: str, stage: str) -> None:
+        """Time ``owner.attribute`` (synchronised) into ``stage_times[stage]``."""
+        original = getattr(owner, attribute)
+        stage_times.setdefault(stage, [])
+
+        def timed(*a, **kw):
             _sync(device)
             t = time.perf_counter()
-            out = original_resize(*a, **kw)
+            out = original(*a, **kw)
             _sync(device)
-            stage_times["final_resize"].append(time.perf_counter() - t)
+            stage_times[stage].append(time.perf_counter() - t)
             return out
 
-        runtime._finish_resized = timed_resize
+        setattr(owner, attribute, timed)
+
     if args.stages:
-        cls = runtime._ComfyBackend
         for name in ("encode", "transform", "decode"):
-            original = getattr(cls, name)
-
-            def timed(self, *a, _orig=original, _name=name):
-                _sync(device)
-                t = time.perf_counter()
-                out = _orig(self, *a)
-                _sync(device)
-                stage_times[_name].append(time.perf_counter() - t)
-                return out
-
-            setattr(cls, name, timed)
+            instrument(runtime._ComfyBackend, name, name)
+        # input tiles: native bicubic enlargement or direct sampling
+        instrument(TiledRestorer, "_model_pixels", "input_sampling")
+        instrument(DirectRestorer, "_model_pixels", "input_sampling")
+        instrument(TiledRestorer, "_commit", "accumulation")
+        instrument(TiledRestorer, "_finalize", "accumulation")
+        # output assembly includes the final resize when there is one
+        instrument(runtime, "assemble_output", "output_assembly")
+        if any(scale for scale in args.output_scales):
+            instrument(runtime, "_finish_resized", "final_resize")
 
     results = {
         "device": str(device),
@@ -182,12 +196,16 @@ def main() -> None:
     for size in args.sizes:
         image = torch.rand(1, size, size, 3, generator=gen)
         for factor in args.factors:
-            for batch, acc, output_scale in (
-                (b, a, o)
+            for batch, acc, output_scale, mode, strength, reconstruction in (
+                (b, a, o, m, cs, r)
                 for b in args.tile_batch_sizes
                 for a in args.accumulation
                 for o in args.output_scales
-                if o <= factor  # output scales above the native factor are invalid for it
+                for m in args.restoration_modes
+                for cs in args.correction_strengths
+                for r in args.reconstructions
+                # calibrated output scales above the native factor are invalid for it
+                if o <= (4 if m == "direct_fractional" else factor)
             ):
                 repetitions = []
                 for k in range(args.warmup + args.repeats):
@@ -210,6 +228,9 @@ def main() -> None:
                             accumulation_device=acc,
                             vae=vae,
                             output_scale=output_scale,
+                            restoration_mode=mode,
+                            correction_strength=strength,
+                            reconstruction=reconstruction,
                         )
                         _sync(device)
                         seconds = time.perf_counter() - t
@@ -229,6 +250,7 @@ def main() -> None:
                         # final assembly ran out of device memory and finished in system memory
                         "assembly_fallback": stats.assembly_fallback,
                         "tiles": stats.tiles,
+                        "transformer_evaluations": stats.transformer_evaluations,
                         "effective_batch": stats.final_batch_size,
                         "batch_sizes": sorted(set(stats.batch_sizes)),
                         "oom_retries": stats.oom_retries,
@@ -253,6 +275,9 @@ def main() -> None:
                     "tile_batch_size": batch,
                     "accumulation": acc,
                     "output_scale": output_scale,
+                    "restoration_mode": mode,
+                    "correction_strength": strength,
+                    "reconstruction": reconstruction,
                     "median_seconds": median,
                     "min_seconds": min(times),
                     "tiles_per_second": repetitions[0]["tiles"] / median,
