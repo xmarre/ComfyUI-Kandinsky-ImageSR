@@ -1170,3 +1170,191 @@ def test_native_output_is_released_when_assembly_fails(env, monkeypatch, failure
     assert isinstance(caught, expected)
     gc.collect()
     assert refs and refs[0]() is None, "the native restoration outlives the failed call"
+
+
+# ----------------------------------------------------------------------------- direct fractional restoration
+
+
+def test_direct_mode_schema_is_appended_and_optional(env):
+    optional = env["upscale"].GET_NODE_INFO_V1()["input"]["optional"]
+    assert list(optional) == ["vae", "output_scale", "restoration_mode", "correction_strength", "reconstruction"]
+    assert _options(optional["restoration_mode"]) == ["calibrated", "direct_fractional"]
+    assert optional["restoration_mode"][1]["default"] == "calibrated"
+    spec = optional["correction_strength"][1]
+    assert (spec["default"], spec["min"], spec["max"], spec["step"]) == (1.0, 0.0, 1.0, 0.01)
+    assert _options(optional["reconstruction"]) == ["latent", "residual"]
+    assert optional["reconstruction"][1]["default"] == "latent"
+
+
+def test_explicit_defaults_of_the_new_inputs_are_bitwise_unchanged(env, monkeypatch):
+    model = _load(env)
+    for image in (_image(batch=2, h=33, w=47), _rgba()):
+        for scale in (0.0, 1.5):
+            before = _run(env, model, image, output_scale=scale)
+            after = _run(
+                env, model, image, output_scale=scale,
+                restoration_mode="calibrated", correction_strength=1.0, reconstruction="latent",
+            )  # fmt: skip
+            assert torch.equal(before, after)
+
+
+@pytest.mark.parametrize("h,w,scale", [(33, 47, 1.2), (27, 41, 1.5), (40, 56, 1.0), (31, 45, 1.75), (9, 5, 2.5)])
+def test_direct_mode_restores_at_the_requested_size_without_a_native_pass(env, monkeypatch, h, w, scale):
+    from decimal import Decimal
+
+    from kandinsky_sr.resize import target_size
+
+    runtime = env["module"]("runtime")
+    direct_module = env["module"]("direct")
+    model = _load(env)
+    grids = []
+    real_init = runtime.TiledRestorer.__init__
+
+    def spy(self, backend, grid):
+        grids.append(grid)
+        real_init(self, backend, grid)
+
+    monkeypatch.setattr(runtime.TiledRestorer, "__init__", spy)
+    _forbid_resize(env, monkeypatch)
+    image = _rgba(batch=2, h=h, w=w)
+    out = _run(env, model, image, restoration_mode="direct_fractional", output_scale=scale, correction_strength=0.5)
+    size = target_size(h, w, Decimal(str(scale)), 4)
+    assert out.shape == (2, *size, 4) and torch.isfinite(out).all() and out.min() >= 0 and out.max() <= 1
+    (grid,) = grids
+    assert isinstance(grid, direct_module.DirectGrid) and (grid.out_height, grid.out_width) == size
+    import torch.nn.functional as F
+
+    alpha = F.interpolate(image[..., 3:].movedim(-1, 1), size=size, mode="bilinear", align_corners=False)
+    assert torch.equal(out[..., 3:], alpha.clamp(0, 1).movedim(1, -1))
+
+
+def test_direct_mode_at_the_family_size_delegates_to_the_native_grid_and_honours_strength(env):
+    model = _load(env)
+    image = _image(batch=1, h=33, w=47)
+    native = _run(env, model, image)
+    for scale in (0.0, 2.0):
+        assert torch.equal(_run(env, model, image, restoration_mode="direct_fractional", output_scale=scale), native)
+    weak_direct = _run(env, model, image, restoration_mode="direct_fractional", correction_strength=0.4)
+    weak_calibrated = _run(env, model, image, correction_strength=0.4)
+    assert torch.equal(weak_direct, weak_calibrated) and not torch.equal(weak_direct, native)
+
+
+def test_zero_strength_does_not_load_or_run_the_transformer(env, monkeypatch):
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    loaded = []
+    real_load = mm.load_models_gpu
+    monkeypatch.setattr(
+        mm, "load_models_gpu", lambda models, **kw: loaded.append(list(models)) or real_load(models, **kw)
+    )
+    stats = []
+    real_run = runtime.TiledRestorer.run
+    monkeypatch.setattr(
+        runtime.TiledRestorer, "run", lambda self, i, o: stats.append(real_run(self, i, o)) or stats[-1]
+    )
+
+    def no_transformer(*args, **kwargs):
+        raise AssertionError("the transformer ran at correction strength 0")
+
+    monkeypatch.setattr(runtime._ComfyBackend, "transform", no_transformer)
+    out = _run(env, model, _image(), restoration_mode="direct_fractional", output_scale=1.3, correction_strength=0.0)
+    assert out.shape[1:3] == (52, 73)
+    assert model.patcher not in loaded[-1] and stats[-1][1].transformer_evaluations == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"restoration_mode": "fast"}, "restoration_mode"),
+        ({"reconstruction": "pixel"}, "reconstruction"),
+        ({"correction_strength": -0.1}, "correction_strength"),
+        ({"correction_strength": 1.01}, "correction_strength"),
+        ({"correction_strength": float("nan")}, "correction_strength"),
+        ({"correction_strength": float("inf")}, "correction_strength"),
+        ({"correction_strength": "0.5"}, "correction_strength"),
+        ({"restoration_mode": "direct_fractional", "output_scale": 4.5}, "output_scale"),
+        ({"restoration_mode": "direct_fractional", "output_scale": 0.5}, "output_scale"),
+        ({"restoration_mode": "calibrated", "output_scale": 2.5}, "select the 4x"),
+    ],
+)
+def test_direct_mode_validation_fails_before_model_work(env, monkeypatch, kwargs, message):
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    model = _load(env)
+
+    def no_load(*args, **kw):
+        raise AssertionError("models were loaded before validation")
+
+    monkeypatch.setattr(mm, "load_models_gpu", no_load)
+    monkeypatch.setattr(runtime, "resolve_vae", no_load)
+    with pytest.raises(ValueError, match=message):
+        _run(env, model, _image(), **kwargs)
+
+
+def test_direct_mode_memory_budget_uses_the_direct_geometry(env, monkeypatch):
+    import comfy.model_management as mm
+
+    runtime = env["module"]("runtime")
+    direct_module = env["module"]("direct")
+    model = _load(env)
+    gpu = torch.device("cuda", 0)
+    requested = []
+
+    class Planned(Exception):
+        pass
+
+    def plan(models, memory_required=0, **kwargs):
+        requested.append(memory_required)
+        raise Planned
+
+    monkeypatch.setattr(model.patcher, "load_device", gpu)
+    monkeypatch.setattr(mm, "intermediate_device", lambda: gpu)
+    monkeypatch.setattr(mm, "load_models_gpu", plan)
+    image = _image(batch=2, h=200, w=300)
+    for mode, reconstruction in (("direct_fractional", "latent"), ("direct_fractional", "residual")):
+        with pytest.raises(Planned):
+            runtime.upscale(
+                model, image, 2, 1, tile_batch_size=1, accumulation_device="gpu", output_scale=1.2,
+                restoration_mode=mode, reconstruction=reconstruction,
+            )  # fmt: skip
+    grid = direct_module.plan_grid(200, 300, (240, 360), 2, model.config.tile_size, 0.25)
+    per_tile = runtime.estimate_tile_memory(model, model.bundled_vae()).per_tile + grid.sample_bytes()
+    output = 2 * 240 * 360 * 3 * 4  # direct output size, not the native 400x600
+    acc = grid.accumulation_bytes()  # one padded tile plane, not a native-size buffer
+    assert requested[0] == per_tile + acc + output
+    assert requested[1] == requested[0] + 2 * 3 * 4 * model.config.tile_size**2  # tile kept for the residual
+
+
+def test_repeated_runs_across_modes_keep_no_state(env):
+    model = _load(env)
+    image = _image(batch=1, h=31, w=45)
+    first = _run(env, model, image)
+    sizes = []
+    for kwargs in (
+        {"restoration_mode": "direct_fractional", "output_scale": 1.2, "correction_strength": 0.3},
+        {"output_scale": 1.2},
+        {"restoration_mode": "direct_fractional", "output_scale": 1.5, "reconstruction": "residual"},
+        {},
+    ):
+        out = _run(env, model, image, **kwargs)
+        sizes.append(tuple(out.shape[1:3]))
+    assert sizes == [(37, 54), (37, 54), (47, 68), (62, 90)]
+    assert torch.equal(out, first)
+
+
+def test_direct_mode_releases_its_output_after_failure(env, monkeypatch):
+    runtime = env["module"]("runtime")
+    model = _load(env)
+    refs = _native_output_ref(env, monkeypatch)
+    monkeypatch.setattr(runtime, "_finish_output", lambda *a: (_ for _ in ()).throw(RuntimeError("assembly failed")))
+    caught = None
+    try:
+        _run(env, model, _image(batch=2, h=60, w=70), restoration_mode="direct_fractional", output_scale=1.4)
+    except RuntimeError as error:
+        caught = error
+    assert caught is not None
+    gc.collect()
+    assert refs and refs[0]() is None
